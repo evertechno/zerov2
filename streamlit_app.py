@@ -5,7 +5,7 @@ from supabase import create_client, Client
 import pandas as pd
 import json
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, List
 
 st.set_page_config(page_title="Kite Connect + Supabase Index", layout="wide")
 st.title("📊 Kite Connect (Zerodha) + Supabase Index (Prod-ready)")
@@ -31,11 +31,11 @@ API_KEY, API_SECRET, REDIRECT_URI = load_kite_conf()
 SUPABASE_URL, SUPABASE_KEY = load_supabase_conf()
 
 if not (API_KEY and API_SECRET and REDIRECT_URI):
-    st.error("Missing Kite credentials in Streamlit secrets. Add [kite] api_key, api_secret and redirect_uri.")
+    st.error("Missing Kite credentials in Streamlit secrets.")
     st.stop()
 
 if not (SUPABASE_URL and SUPABASE_KEY):
-    st.error("Missing Supabase credentials in Streamlit secrets. Add [supabase] url and anon_key.")
+    st.error("Missing Supabase credentials in Streamlit secrets.")
     st.stop()
 
 # -------------------------
@@ -90,6 +90,7 @@ if not supabase_current_user():
     email = st.sidebar.text_input("Email", key="login_email")
     password = st.sidebar.text_input("Password", type="password", key="login_password")
     col1, col2 = st.sidebar.columns(2)
+
     if col1.button("Login"):
         try:
             res = supabase.auth.sign_in_with_password({"email": email, "password": password})
@@ -104,9 +105,10 @@ if not supabase_current_user():
                 st.sidebar.error("Login response did not contain user.")
         except Exception as e:
             st.sidebar.error(f"Login failed: {pretty_error(e)}")
+
     if col2.button("Sign up"):
         try:
-            res = supabase.auth.sign_up({"email": email, "password": password})
+            supabase.auth.sign_up({"email": email, "password": password})
             st.sidebar.info("Signup created. Confirm email before login (check inbox).")
         except Exception as e:
             st.sidebar.error(f"Sign up failed: {pretty_error(e)}")
