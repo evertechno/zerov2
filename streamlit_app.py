@@ -216,7 +216,7 @@ if request_token and "kite_access_token" not in st.session_state:
         else:
             st.error("No access token returned from Kite.")
     except Exception as e:
-        st.error(f"Failed to generate Kite session: {pretty_error(e)})
+        st.error(f"Failed to generate Kite session: {pretty_error(e)}")
 
 if "kite_access_token" not in st.session_state:
     st.warning("Please login to Kite using the link above to fetch live quotes.")
