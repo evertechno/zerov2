@@ -50,9 +50,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # -------------------------
 def supabase_current_user():
     try:
-        session = supabase.auth.session()
-        if session and "user" in session and session["user"]:
-            return session["user"]
+        session = st.session_state.get("supabase_session")
+        if session and hasattr(session, "user"):
+            return session.user
         return st.session_state.get("supabase_user")
     except Exception:
         return st.session_state.get("supabase_user")
@@ -94,22 +94,24 @@ if not supabase_current_user():
     if col1.button("Login"):
         try:
             res = supabase.auth.sign_in_with_password({"email": email, "password": password})
-            user = res.get("user") if isinstance(res, dict) else None
-            if not user:
-                user = (res.get("data") or {}).get("user") if isinstance(res, dict) else None
+            user = (res.data or {}).get("user") if hasattr(res, "data") else None
             if user:
                 st.session_state["supabase_session"] = res
                 st.session_state["supabase_user"] = user
                 st.experimental_rerun()
             else:
-                st.sidebar.error("Login response did not contain user.")
+                err_msg = (res.error.message if hasattr(res, "error") and res.error else "Unknown error")
+                st.sidebar.error(f"Login failed: {err_msg}")
         except Exception as e:
             st.sidebar.error(f"Login failed: {pretty_error(e)}")
 
     if col2.button("Sign up"):
         try:
-            supabase.auth.sign_up({"email": email, "password": password})
-            st.sidebar.info("Signup created. Confirm email before login (check inbox).")
+            res = supabase.auth.sign_up({"email": email, "password": password})
+            if hasattr(res, "error") and res.error:
+                st.sidebar.error(f"Signup failed: {res.error.message}")
+            else:
+                st.sidebar.info("Signup created. Confirm email before login (check inbox).")
         except Exception as e:
             st.sidebar.error(f"Sign up failed: {pretty_error(e)}")
 else:
@@ -241,8 +243,6 @@ with tab_create:
                                 st.error(f"Failed to save index: {pretty_error(e)}")
                     else:
                         st.warning("Login to Supabase to save indices.")
-        except Exception as e:
-            st.error(f"Failed to read CSV: {pretty_error(e)}")
 
 # -------------------------
 # Saved Indices
@@ -285,7 +285,7 @@ with tab_saved:
                                     "value": value,
                                     "details": json.dumps(calc_details)
                                 }).execute()
-                                supabase.table("indices").update({"last_value": value, "updated_at": "now()"}).eq("id", r["id"]).execute()
+                                supabase.table("indices"].update({"last_value": value, "updated_at": "now()"}).eq("id", r["id"]).execute()
                                 st.success(f"Recalculated & saved snapshot — {value:.4f}")
                         except Exception as e:
                             st.error(f"Recalc failed: {pretty_error(e)}")
