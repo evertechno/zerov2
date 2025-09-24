@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt # Added matplotlib import for pandas styler (tho
 from typing import Optional, Dict, List
 
 st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
-st.title("Kite Connect (Zerodha) — Advanced Financial Analysis")
+st.title("📊 Kite Connect (Zerodha) — Advanced Financial Analysis")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
 # ---------------------------
@@ -72,6 +72,12 @@ def supabase_current_user():
     user = st.session_state.get("supabase_user")
     if user:
         return user
+    
+    # Fallback to check if a full session object was stored
+    session_response = st.session_state.get("supabase_session")
+    if session_response and hasattr(session_response, "user") and session_response.user:
+        return session_response.user
+    
     return None
 
 def get_user_id(user_obj):
@@ -95,119 +101,7 @@ def pretty_error(e: Exception) -> str:
     return str(e)
 
 # ---------------------------
-# Sidebar: Supabase Auth (Integrated into sidebar logic)
-# ---------------------------
-st.sidebar.markdown("---")
-st.sidebar.header("Supabase Authentication")
-
-if "supabase_session" not in st.session_state:
-    st.session_state["supabase_session"] = None
-if "supabase_user" not in st.session_state:
-    st.session_state["supabase_user"] = None
-
-current_supabase_user = supabase_current_user()
-
-if not current_supabase_user:
-    st.sidebar.subheader("Supabase Login / Sign up")
-    sb_email = st.sidebar.text_input("Email", key="sb_login_email")
-    sb_password = st.sidebar.text_input("Password", type="password", key="sb_login_password")
-    col_sb_1, col_sb_2 = st.sidebar.columns(2)
-
-    with col_sb_1:
-        if st.button("Login (Supabase)", key="sb_login_button"):
-            if not sb_email or not sb_password:
-                st.sidebar.error("Email and password cannot be empty.")
-            else:
-                try:
-                    res = supabase.auth.sign_in_with_password({"email": sb_email, "password": sb_password})
-                    
-                    if res.user:
-                        st.session_state["supabase_session"] = res.session
-                        st.session_state["supabase_user"] = res.user
-                        st.sidebar.success(f"Supabase login successful! User: {get_user_email(res.user)}")
-                        st.experimental_rerun()
-                    else:
-                        error_msg = "Unknown error during Supabase login."
-                        if res.error:
-                            error_msg = res.error.message
-                        st.sidebar.error(f"Supabase Login failed: {error_msg}")
-                except Exception as e:
-                    st.sidebar.error(f"Supabase Login failed: {pretty_error(e)}")
-
-    with col_sb_2:
-        if st.button("Sign up (Supabase)", key="sb_signup_button"):
-            if not sb_email or not sb_password:
-                st.sidebar.error("Email and password cannot be empty.")
-            else:
-                try:
-                    res = supabase.auth.sign_up({"email": sb_email, "password": sb_password})
-                    
-                    if res.user:
-                        st.sidebar.info("Signup created successfully. Please check your email to confirm your account before logging in.")
-                    else:
-                        error_msg = "Unknown error during Supabase signup."
-                        if res.error:
-                            error_msg = res.error.message
-                        st.sidebar.error(f"Supabase Signup failed: {error_msg}")
-                except Exception as e:
-                    st.sidebar.error(f"Supabase Sign up failed: {pretty_error(e)}")
-else:
-    st.sidebar.success(f"Supabase: Signed in as {get_user_email(current_supabase_user)}")
-    if st.sidebar.button("Logout (Supabase)", key="sb_logout_button"):
-        try:
-            supabase.auth.sign_out()
-        except Exception as e:
-            st.sidebar.warning(f"Supabase logout had a minor issue: {pretty_error(e)}")
-        st.session_state.pop("supabase_session", None)
-        st.session_state.pop("supabase_user", None)
-        st.experimental_rerun()
-
-
-# ---------------------------
-# Helper: init unauth Kite client (used for login URL)
-# ---------------------------
-kite_client = KiteConnect(api_key=API_KEY)
-login_url = kite_client.login_url()
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### Step 1 — Login to Kite")
-st.sidebar.write("Click the link below to login to Kite. Zerodha will redirect to your configured redirect URI with `request_token` in query params.")
-st.sidebar.markdown(f"[🔗 Open Kite login]({login_url})")
-
-# Read request_token from URL
-query_params = st.query_params
-request_token = query_params.get("request_token") # st.query_params returns single string for single value
-
-# Exchange request_token for access_token (only once)
-if request_token and "kite_access_token" not in st.session_state:
-    st.sidebar.info("Received request_token — exchanging for access token...")
-    try:
-        data = kite_client.generate_session(request_token, api_secret=API_SECRET)
-        access_token = data.get("access_token")
-        st.session_state["kite_access_token"] = access_token
-        st.session_state["kite_login_response"] = data
-        st.sidebar.success("Access token obtained and stored in session.")
-        st.sidebar.download_button("⬇️ Download token JSON", json.dumps(data, default=str), file_name="kite_token.json")
-        
-        # Clear request_token from query params to prevent re-exchange on refresh
-        if "request_token" in st.query_params:
-            del st.query_params["request_token"]
-        st.experimental_rerun()
-    except Exception as e:
-        st.sidebar.error(f"Failed to generate session: {e}")
-        st.stop()
-
-# ---------------------------
-# Create authenticated kite client if we have access token
-# ---------------------------
-k = None
-if "kite_access_token" in st.session_state:
-    access_token = st.session_state["kite_access_token"]
-    k = KiteConnect(api_key=API_KEY)
-    k.set_access_token(access_token)
-
-# ---------------------------
-# Utility: instruments lookup (kept as it's essential for fetching historical data)
+# Helper: Kite Connect Data Fetching (Moved up for definition order)
 # ---------------------------
 @st.cache_data(show_spinner=False)
 def load_instruments(_kite_instance, exchange=None):
@@ -237,6 +131,27 @@ def find_instrument_token(df, tradingsymbol, exchange="NSE"):
     if not hits.empty:
         return int(hits.iloc[0]["instrument_token"])
     return None
+
+def fetch_last_price(kite_instance: KiteConnect, symbol: str, exchange_prefix="NSE") -> Optional[float]:
+    """Fetches the last traded price for a given symbol."""
+    try:
+        q = kite_instance.quote(f"{exchange_prefix}:{symbol}")
+        key = f"{exchange_prefix}:{symbol}"
+        if q and key in q and "last_price" in q[key]:
+            return float(q[key]["last_price"])
+        return None
+    except Exception as e:
+        # st.error(f"Error fetching price for {symbol}: {e}") # Debugging
+        return None
+
+def batch_fetch_prices(kite_instance: KiteConnect, syms: List[str], exchange_prefix="NSE", sleep_between=0.15) -> Dict[str, Optional[float]]:
+    """Fetches prices for a batch of symbols with a delay between calls."""
+    out = {}
+    for s in syms:
+        out[s] = fetch_last_price(kite_instance, s, exchange_prefix=exchange_prefix)
+        time.sleep(sleep_between)
+    return out
+
 
 def get_ltp_price(kite_instance, symbol, exchange="NSE"):
     try:
@@ -1714,8 +1629,7 @@ with tab_saved_indices:
                             st.info("Fetching live prices for index components...")
                             if not k:
                                 st.warning("Kite Connect not logged in. Cannot fetch live prices for index components.")
-                                # Proceed without live prices if Kite is not logged in, but warn
-                                df_upload["Last Price"] = np.nan
+                                df_upload["Last Price"] = np.nan # Assign NaN if prices cannot be fetched
                             else:
                                 prices = batch_fetch_prices(k, df_upload["symbol"].tolist(), sleep_between=0.12)
                                 df_upload["Last Price"] = df_upload["symbol"].map(prices)
@@ -1752,7 +1666,7 @@ with tab_saved_indices:
                                             "details": json.dumps(calc_details)
                                         }).execute()
                                         st.success("Custom Index & initial snapshot saved successfully!")
-                                        st.experimental_rerun()
+                                        st.rerun() # Use st.rerun()
                                     else:
                                         st.error("Failed to retrieve index ID after saving. Snapshot not saved.")
                                 except Exception as e:
@@ -1848,7 +1762,7 @@ with tab_saved_indices:
                                             supabase.table("indices").update({"last_value": new_index_value, "updated_at": "now()"}).eq("id", r["id"]).execute()
                                             
                                             st.success(f"Recalculated & saved snapshot — New Index Value: {new_index_value:,.4f}")
-                                            st.experimental_rerun()
+                                            st.rerun() # Use st.rerun()
                                         except Exception as e:
                                             st.error(f"Recalculation failed: {pretty_error(e)}")
 
@@ -1859,7 +1773,7 @@ with tab_saved_indices:
                                         supabase.table("index_calculations").delete().eq("index_id", r["id"]).execute()
                                         supabase.table("indices").delete().eq("id", r["id"]).execute()
                                         st.success(f"Index '{r['name']}' and all its snapshots deleted.")
-                                        st.experimental_rerun()
+                                        st.rerun() # Use st.rerun()
                                     except Exception as e:
                                         st.error(f"Failed to delete index: {pretty_error(e)}. Check RLS policies.")
             except Exception as e:
