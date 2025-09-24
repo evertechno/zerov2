@@ -568,7 +568,7 @@ def render_portfolio_tab(kite_client: KiteConnect | None):
                 {"Category": "Equity - Available", "Value": st.session_state["margins_data"].get('equity', {}).get('available', {}).get('live_balance', 0)},
                 {"Category": "Equity - Used", "Value": st.session_state["margins_data"].get('equity', {}).get('utilised', {}).get('overall', 0)},
                 {"Category": "Commodity - Available", "Value": st.session_state["margins_data"].get('commodity', {}).get('available', {}).get('live_balance', 0)},
-                {"Category": "Commodity - Used", "Value": st.session_state["margins_data"].get('commodity', {}).get('utilised', {}).get('overall', 0)},
+                {"Category": "Commodity - Used", "Value": st.session_state["margins_data'].get('commodity', {}).get('utilised', {}).get('overall', 0)},
             ])
             margins_df["Value"] = margins_df["Value"].apply(lambda x: f"₹{x:,.2f}")
             st.dataframe(margins_df, use_container_width=True)
@@ -1166,6 +1166,12 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         benchmark_exchange = st.selectbox("Benchmark Exchange", ["NSE", "BSE", "NFO"], key=f"bench_exchange_{index_id or index_name}")
 
         if st.button("Add Benchmarks to Chart", key=f"add_benchmarks_{index_id or index_name}"):
+            # Load instruments for benchmark token lookup (once for this button click)
+            instruments_df_for_bench = load_instruments_cached(api_key, access_token, benchmark_exchange)
+            if "_error" in instruments_df_for_bench.columns:
+                st.error(f"Failed to load instruments for benchmark lookup: {instruments_df_for_bench.loc[0, '_error']}")
+                return
+
             for bench_symbol in benchmark_symbols:
                 with st.spinner(f"Fetching historical data for benchmark {bench_symbol}..."):
                     # Use get_historical_data_cached for benchmark data
@@ -1173,20 +1179,29 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 
                 if isinstance(bench_hist_df, pd.DataFrame) and "_error" not in bench_hist_df.columns and not bench_hist_df.empty:
                     # Align dates and normalize benchmark
-                    aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df[['close']], left_index=True, right_index=True, how='inner', suffixes=('', '_bench'))
-                    if not aligned_df.empty:
-                        # Normalize benchmark to the same base as custom index
-                        base_index_val = aligned_df['index_value'].iloc[0]
-                        base_bench_val = aligned_df['close_bench'].iloc[0]
-                        if base_bench_val != 0:
-                            aligned_df[f'{bench_symbol}_normalized'] = (aligned_df['close_bench'] / base_bench_val) * base_index_val
-                            fig_index_perf.add_trace(go.Scatter(x=aligned_df.index, y=aligned_df[f'{bench_symbol}_normalized'], mode='lines', name=f'Benchmark: {bench_symbol}', line=dict(dash='dash')))
+                    # Make sure 'close' column exists before trying to select it
+                    if 'close' in bench_hist_df.columns:
+                        aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df[['close']], left_index=True, right_index=True, how='inner', suffixes=('', '_bench'))
+                        if not aligned_df.empty:
+                            # IMPORTANT: Check if 'close_bench' column exists after merge
+                            if 'close_bench' in aligned_df.columns:
+                                # Normalize benchmark to the same base as custom index
+                                base_index_val = aligned_df['index_value'].iloc[0]
+                                base_bench_val = aligned_df['close_bench'].iloc[0]
+                                if base_bench_val != 0:
+                                    aligned_df[f'{bench_symbol}_normalized'] = (aligned_df['close_bench'] / base_bench_val) * base_index_val
+                                    fig_index_perf.add_trace(go.Scatter(x=aligned_df.index, y=aligned_df[f'{bench_symbol}_normalized'], mode='lines', name=f'Benchmark: {bench_symbol}', line=dict(dash='dash')))
+                                else:
+                                    st.warning(f"First historical value of {bench_symbol} is zero, cannot normalize. Skipping benchmark.")
+                            else:
+                                st.warning(f"Benchmark '{bench_symbol}' data missing 'close_bench' column after merge. Skipping benchmark.")
                         else:
-                            st.warning(f"First historical value of {bench_symbol} is zero, cannot normalize.")
+                            st.warning(f"No common historical data between custom index and benchmark {bench_symbol}. Skipping benchmark.")
                     else:
-                        st.warning(f"No common historical data between custom index and benchmark {bench_symbol}.")
+                        st.warning(f"Benchmark '{bench_symbol}' historical data does not contain 'close' column. Skipping benchmark.")
                 else:
-                    st.warning(f"No historical data obtained for benchmark {bench_symbol}. Skipping. Error: {bench_hist_df.get('_error', 'Unknown')}")
+                    error_msg = bench_hist_df.get('_error', ['Unknown error'])[0] if isinstance(bench_hist_df, pd.DataFrame) else 'Unknown error'
+                    st.warning(f"No historical data obtained for benchmark {bench_symbol}. Skipping. Error: {error_msg}")
 
         fig_index_perf.update_layout(title_text=f"Historical Performance: {index_name} vs. Benchmarks",
                                   xaxis_title="Date", yaxis_title="Index Value (Normalized to 100 on Start Date)",
