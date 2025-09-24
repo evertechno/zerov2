@@ -1,7 +1,6 @@
 import streamlit as st
 from kiteconnect import KiteConnect
 from kiteconnect import KiteTicker  # websocket ticker
-from supabase import create_client, Client
 import pandas as pd
 import json
 import threading
@@ -17,91 +16,76 @@ from sklearn.metrics import mean_squared_error, r2_score
 import lightgbm as lgb
 import ta # Technical Analysis library
 import yfinance as yf # For fetching benchmark data for comparison
-import matplotlib.pyplot as plt
-from typing import Optional, Dict, List
+import matplotlib.pyplot as plt # Added matplotlib import for pandas styler
 
 st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
-st.title("📊 Kite Connect (Zerodha) — Advanced Financial Analysis")
+st.title("Kite Connect (Zerodha) — Advanced Financial Analysis")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
 # ---------------------------
 # CONFIG / SECRETS
 # ---------------------------
-def load_kite_conf():
-    try:
-        kite_conf = st.secrets["kite"]
-        return kite_conf.get("api_key"), kite_conf.get("api_secret"), kite_conf.get("redirect_uri")
-    except Exception:
-        return None, None, None
+try:
+    kite_conf = st.secrets["kite"]
+    API_KEY = kite_conf.get("api_key")
+    API_SECRET = kite_conf.get("api_secret")
+    REDIRECT_URI = kite_conf.get("redirect_uri")
+except Exception:
+    API_KEY = None
+    API_SECRET = None
+    REDIRECT_URI = None
 
-def load_supabase_conf():
-    try:
-        sb = st.secrets["supabase"]
-        return sb.get("url"), sb.get("anon_key")
-    except Exception:
-        return None, None
-
-API_KEY, API_SECRET, REDIRECT_URI = load_kite_conf()
-SUPABASE_URL, SUPABASE_KEY = load_supabase_conf()
-
-if not (API_KEY and API_SECRET and REDIRECT_URI):
+if not API_KEY or not API_SECRET or not REDIRECT_URI:
     st.error("Missing Kite credentials in Streamlit secrets. Add [kite] api_key, api_secret and redirect_uri in `.streamlit/secrets.toml`.")
     st.info("Example `secrets.toml`:\n```toml\n[kite]\napi_key=\"YOUR_KITE_API_KEY\"\napi_secret=\"YOUR_KITE_SECRET\"\nredirect_uri=\"http://localhost:8501\"\n```")
     st.stop()
 
-if not (SUPABASE_URL and SUPABASE_KEY):
-    st.error("Missing Supabase credentials in Streamlit secrets. Please configure `supabase.url` and `supabase.anon_key`.")
-    st.info("Example `secrets.toml`:\n```toml\n[supabase]\nurl=\"YOUR_SUPABASE_URL\"\nanon_key=\"YOUR_SUPABASE_ANON_KEY\"\n```")
-    st.stop()
+# ---------------------------
+# Helper: init unauth client (used for login URL)
+# ---------------------------
+kite_client = KiteConnect(api_key=API_KEY)
+login_url = kite_client.login_url()
 
+st.sidebar.markdown("### Step 1 — Login to Kite")
+st.sidebar.write("Click the link below to login to Kite. After login Zerodha will redirect to your configured redirect URI with `request_token` in query params.")
+st.sidebar.markdown(f"[🔗 Open Kite login]({login_url})")
+
+# read request_token from URL (Streamlit >= 1.14)
+query_params = st.query_params
+request_token = None
+if "request_token" in query_params:
+    rt = query_params.get("request_token")
+    if isinstance(rt, list):
+        request_token = rt[0]
+    else:
+        request_token = rt
+
+# Exchange request_token for access_token (only once)
+if request_token and "kite_access_token" not in st.session_state:
+    st.sidebar.info("Received request_token — exchanging for access token...")
+    try:
+        data = kite_client.generate_session(request_token, api_secret=API_SECRET)
+        access_token = data.get("access_token")
+        st.session_state["kite_access_token"] = access_token
+        st.session_state["kite_login_response"] = data
+        st.sidebar.success("Access token obtained and stored in session.")
+        st.sidebar.download_button("⬇️ Download token JSON", json.dumps(data, default=str), file_name="kite_token.json")
+        st.rerun()
+    except Exception as e:
+        st.sidebar.error(f"Failed to generate session: {e}")
+        st.stop()
 
 # ---------------------------
-# Initialize Supabase client
+# Create authenticated kite client if we have access token
 # ---------------------------
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-# ---------------------------
-# Helper: Supabase User Management
-# ---------------------------
-def supabase_current_user():
-    """
-    Retrieves the current Supabase user from session state.
-    Handles different ways the session or user might be stored (dict vs object).
-    """
-    user = st.session_state.get("supabase_user")
-    if user:
-        return user
-    
-    # Fallback to check if a full session object was stored
-    session_response = st.session_state.get("supabase_session")
-    if session_response and hasattr(session_response, "user") and session_response.user:
-        return session_response.user
-    
-    return None
-
-def get_user_id(user_obj):
-    """Helper to safely get user ID from a Supabase user object/dict."""
-    if isinstance(user_obj, dict):
-        return user_obj.get("id")
-    elif hasattr(user_obj, "id"):
-        return user_obj.id
-    return None
-
-def get_user_email(user_obj):
-    """Helper to safely get user email from a Supabase user object/dict."""
-    if isinstance(user_obj, dict):
-        return user_obj.get("email")
-    elif hasattr(user_obj, "email"):
-        return user_obj.email
-    return "N/A"
-
-def pretty_error(e: Exception) -> str:
-    """Formats an exception into a readable string."""
-    return str(e)
+k = None
+if "kite_access_token" in st.session_state:
+    access_token = st.session_state["kite_access_token"]
+    k = KiteConnect(api_key=API_KEY)
+    k.set_access_token(access_token)
 
 # ---------------------------
-# Helper: Kite Connect Data Fetching (Moved up for definition order)
+# Utility: instruments lookup (kept as it's essential for fetching historical data)
 # ---------------------------
 @st.cache_data(show_spinner=False)
 def load_instruments(_kite_instance, exchange=None):
@@ -131,26 +115,6 @@ def find_instrument_token(df, tradingsymbol, exchange="NSE"):
     if not hits.empty:
         return int(hits.iloc[0]["instrument_token"])
     return None
-
-def fetch_last_price(kite_instance: KiteConnect, symbol: str, exchange_prefix="NSE") -> Optional[float]:
-    """Fetches the last traded price for a given symbol."""
-    try:
-        q = kite_instance.quote(f"{exchange_prefix}:{symbol}")
-        key = f"{exchange_prefix}:{symbol}"
-        if q and key in q and "last_price" in q[key]:
-            return float(q[key]["last_price"])
-        return None
-    except Exception as e:
-        return None
-
-def batch_fetch_prices(kite_instance: KiteConnect, syms: List[str], exchange_prefix="NSE", sleep_between=0.15) -> Dict[str, Optional[float]]:
-    """Fetches prices for a batch of symbols with a delay between calls."""
-    out = {}
-    for s in syms:
-        out[s] = fetch_last_price(kite_instance, s, exchange_prefix=exchange_prefix)
-        time.sleep(sleep_between)
-    return out
-
 
 def get_ltp_price(kite_instance, symbol, exchange="NSE"):
     try:
@@ -182,7 +146,7 @@ def get_historical(kite_instance, symbol, from_date, to_date, interval="day", ex
         token = find_instrument_token(inst_df, symbol, exchange)
         
         if not token:
-            st.info(f"Instrument token for {symbol} on {exchange} not found in cache. Attempting to fetch all instruments for {exchange}...")
+            st.info(f"Instrument token for {symbol} on {exchange} not found in cache. Attempting to fetch...")
             all_instruments = load_instruments(kite_instance, exchange) 
             if not all_instruments.empty:
                 st.session_state["instruments_df"] = all_instruments
@@ -219,6 +183,7 @@ def add_indicators(df, sma_short=5, sma_long=20, rsi_window=14, macd_fast=12, ma
     macd_obj = ta.trend.MACD(df['close'], window_fast=macd_fast, window_slow=macd_slow, window_sign=macd_signal)
     df['MACD'] = macd_obj.macd()
     df['MACD_signal'] = macd_obj.macd_signal()
+    # Adding MACD Histogram for visualization
     df['MACD_hist'] = macd_obj.macd_diff() 
     
     bollinger = ta.volatility.BollingerBands(df['close'], window=bb_window, window_dev=bb_std_dev)
@@ -251,8 +216,8 @@ def calculate_performance_metrics(returns_series, risk_free_rate=0.0):
     sharpe_ratio = (annualized_return - risk_free_rate) / annualized_volatility if annualized_volatility != 0 else np.nan
 
     # Max Drawdown
-    peak = (1 + returns_series / 100).cumprod().expanding(min_periods=1).max()
-    drawdown = ((1 + returns_series / 100).cumprod() - peak) / peak
+    peak = cumulative_returns.expanding(min_periods=1).max()
+    drawdown = (cumulative_returns - peak) / (peak + 1e-9) # Avoid division by zero for initial peak 0
     max_drawdown = drawdown.min() * 100
 
     # Sortino Ratio (requires negative returns)
@@ -271,150 +236,29 @@ def calculate_performance_metrics(returns_series, risk_free_rate=0.0):
 
 
 # ---------------------------
-# Sidebar: Supabase Auth (Integrated into sidebar logic)
+# Sidebar for global actions
 # ---------------------------
-st.sidebar.markdown("---")
-st.sidebar.header("Supabase Authentication")
-
-if "supabase_session" not in st.session_state:
-    st.session_state["supabase_session"] = None
-if "supabase_user" not in st.session_state:
-    st.session_state["supabase_user"] = None
-
-current_supabase_user = supabase_current_user()
-
-if not current_supabase_user:
-    st.sidebar.subheader("Supabase Login / Sign up")
-    sb_email = st.sidebar.text_input("Email", key="sb_login_email")
-    sb_password = st.sidebar.text_input("Password", type="password", key="sb_login_password")
-    col_sb_1, col_sb_2 = st.sidebar.columns(2)
-
-    with col_sb_1:
-        if st.button("Login (Supabase)", key="sb_login_button"):
-            if not sb_email or not sb_password:
-                st.sidebar.error("Email and password cannot be empty.")
-            else:
-                try:
-                    res = supabase.auth.sign_in_with_password({"email": sb_email, "password": sb_password})
-                    
-                    if res.user:
-                        st.session_state["supabase_session"] = res.session
-                        st.session_state["supabase_user"] = res.user
-                        st.sidebar.success(f"Supabase login successful! User: {get_user_email(res.user)}")
-                        st.rerun() # Use st.rerun()
-                    else:
-                        error_msg = "Unknown error during Supabase login."
-                        if res.error:
-                            error_msg = res.error.message
-                        st.sidebar.error(f"Supabase Login failed: {error_msg}")
-                except Exception as e:
-                    st.sidebar.error(f"Supabase Login failed: {pretty_error(e)}")
-
-    with col_sb_2:
-        if st.button("Sign up (Supabase)", key="sb_signup_button"):
-            if not sb_email or not sb_password:
-                st.sidebar.error("Email and password cannot be empty.")
-            else:
-                try:
-                    res = supabase.auth.sign_up({"email": sb_email, "password": sb_password})
-                    
-                    if res.user:
-                        st.sidebar.info("Signup created successfully. Please check your email to confirm your account before logging in.")
-                    else:
-                        error_msg = "Unknown error during signup."
-                        if res.error:
-                            error_msg = res.error.message
-                        st.sidebar.error(f"Supabase Signup failed: {error_msg}")
-                except Exception as e:
-                    st.sidebar.error(f"Supabase Sign up failed: {pretty_error(e)}")
-else:
-    st.sidebar.success(f"Supabase: Signed in as {get_user_email(current_supabase_user)}")
-    if st.sidebar.button("Logout (Supabase)", key="sb_logout_button"):
-        try:
-            supabase.auth.sign_out()
-        except Exception as e:
-            st.sidebar.warning(f"Supabase logout had a minor issue: {pretty_error(e)}")
-        st.session_state.pop("supabase_session", None)
-        st.session_state.pop("supabase_user", None)
-        st.rerun() # Use st.rerun()
-
-
-# ---------------------------
-# Helper: init unauth Kite client (used for login URL)
-# ---------------------------
-kite_client = KiteConnect(api_key=API_KEY)
-login_url = kite_client.login_url()
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### Step 1 — Login to Kite")
-st.sidebar.write("Click the link below to login to Kite. Zerodha will redirect to your configured redirect URI with `request_token` in query params.")
-st.sidebar.markdown(f"[🔗 Open Kite login]({login_url})")
-
-# Read request_token from URL
-query_params = st.query_params
-request_token = query_params.get("request_token")
-
-# Initialize k to None at a top level so it always exists
-k = None 
-
-# Exchange request_token for access_token (only once)
-if request_token and "kite_access_token" not in st.session_state:
-    st.sidebar.info("Received request_token — exchanging for access token...")
-    try:
-        data = kite_client.generate_session(request_token, api_secret=API_SECRET)
-        access_token = data.get("access_token")
-        st.session_state["kite_access_token"] = access_token
-        st.session_state["kite_login_response"] = data
-        st.sidebar.success("Access token obtained and stored in session.")
-        st.sidebar.download_button("⬇️ Download token JSON", json.dumps(data, default=str), file_name="kite_token.json")
-        
-        # Clear request_token from query params to prevent re-exchange on refresh
-        if "request_token" in st.query_params:
-            del st.query_params["request_token"]
-        st.rerun() # Use st.rerun()
-    except Exception as e:
-        st.sidebar.error(f"Failed to generate session: {e}")
-        st.stop()
-
-# ---------------------------
-# Create authenticated kite client if we have access token
-# This block runs after potential st.rerun() and ensures k is set.
-# ---------------------------
-if "kite_access_token" in st.session_state:
-    access_token = st.session_state["kite_access_token"]
-    k = KiteConnect(api_key=API_KEY)
-    k.set_access_token(access_token)
-else:
-    # If no access token, k remains None. This is explicitly handled in later blocks.
-    pass 
-
-# ---------------------------
-# Sidebar for global actions (Now safe to reference 'k')
-# ---------------------------
-with st.sidebar: # This is the original sidebar block that now contains updated checks for k
-    # (Removed redundant Kite account info and logout from here as it's above)
-    st.markdown("---") # separator after auth
-    st.header("Kite Account Info")
-    if k: # Now k is guaranteed to be either None or an authenticated client
+with st.sidebar:
+    st.header("Account Info")
+    if k:
         try:
             profile = k.profile()
-            st.success("Kite Authenticated ✅")
+            st.success("Authenticated ✅")
             st.write(f"**User:** {profile.get('user_name') or profile.get('user_id')}")
             st.write(f"**User ID:** {profile.get('user_id')}")
             st.write(f"**Login time:** {profile.get('login_time').strftime('%Y-%m-%d %H:%M:%S')}")
         except Exception:
-            st.warning("Kite Authenticated, but profile fetch failed (check API permissions).")
+            st.warning("Authenticated, but profile fetch failed (check API permissions).")
 
-        if st.button("Logout (clear Kite token)", key="sidebar_logout_btn", help="This will clear your Kite access token from the session and require re-login."):
+        if st.button("Logout (clear token)", key="sidebar_logout_btn", help="This will clear your access token from the session and require re-login."):
             st.session_state.pop("kite_access_token", None)
             st.session_state.pop("kite_login_response", None)
-            for key in list(st.session_state.keys()): 
-                if not key.startswith("supabase_"):
-                    st.session_state.pop(key)
-            st.success("Kite Logged out. Please login again.")
+            for key in list(st.session_state.keys()): # Clear all session state for a clean re-run
+                st.session_state.pop(key)
+            st.success("Logged out. Please login again.")
             st.rerun()
     else:
-        st.info("Not authenticated with Kite yet. Please login using the link above.")
+        st.info("Not authenticated yet. Please login using the link above.")
 
     st.markdown("---")
     st.header("Quick Data Access")
@@ -430,16 +274,17 @@ with st.sidebar: # This is the original sidebar block that now contains updated 
             with st.expander("Show Holdings"):
                 st.dataframe(st.session_state["holdings_data"])
     else:
-        st.info("Login to Kite to access quick data.")
+        st.info("Login to access quick data.")
+
 
 # ---------------------------
 # Main UI - Tabs for modules
 # ---------------------------
-tabs = st.tabs(["Dashboard", "Portfolio", "Orders", "Market & Historical", "Machine Learning Analysis", "Risk & Stress Testing", "Performance Analysis", "Multi-Asset Analysis", "Websocket (stream)", "Saved Indices", "Instruments Utils"])
-tab_dashboard, tab_portfolio, tab_orders, tab_market, tab_ml, tab_risk, tab_performance, tab_multi_asset, tab_ws, tab_saved_indices, tab_inst = tabs
+tabs = st.tabs(["Dashboard", "Portfolio", "Orders", "Market & Historical", "Machine Learning Analysis", "Risk & Stress Testing", "Performance Analysis", "Multi-Asset Analysis", "Custom Index", "Websocket (stream)", "Instruments Utils"])
+tab_dashboard, tab_portfolio, tab_orders, tab_market, tab_ml, tab_risk, tab_performance, tab_multi_asset, tab_custom_index, tab_ws, tab_inst = tabs
 
 # ---------------------------
-# TAB: DASHBOARD
+# TAB: DASHBOARD (New!)
 # ---------------------------
 with tab_dashboard:
     st.header("Personalized Dashboard")
@@ -465,9 +310,11 @@ with tab_dashboard:
         with col2:
             st.subheader("Market Insight (NIFTY 50)")
             try:
+                # Fetch NIFTY 50 (or a default benchmark) LTP
                 nifty_ltp_data = get_ltp_price(k, "NIFTY 50", "NSE")
                 if nifty_ltp_data and "NSE:NIFTY 50" in nifty_ltp_data:
                     nifty_ltp = nifty_ltp_data["NSE:NIFTY 50"]["last_price"]
+                    # Safely get 'change' key
                     nifty_change = nifty_ltp_data["NSE:NIFTY 50"].get("change", 0.0) 
                     st.metric("NIFTY 50 (LTP)", f"₹{nifty_ltp:,.2f}", delta=f"{nifty_change:.2f}%")
                 else:
@@ -475,7 +322,10 @@ with tab_dashboard:
             except Exception as e:
                 st.warning(f"Error fetching NIFTY 50 data: {e}")
 
+            # Optionally, show historical chart for NIFTY
+            # Check if historical_data_NIFTY is an empty DataFrame rather than just None
             if st.session_state.get("historical_data_NIFTY", pd.DataFrame()).empty:
+                # Use a unique key for this button
                 if st.button("Load NIFTY 50 Historical for Chart", key="dashboard_load_nifty_hist_btn"): 
                     with st.spinner("Fetching NIFTY 50 historical data..."):
                         nifty_hist = get_historical(k, "NIFTY 50", datetime.now().date() - timedelta(days=180), datetime.now().date(), "day", "NSE")
@@ -585,7 +435,7 @@ with tab_portfolio:
                     {"Category": "Equity - Available", "Value": st.session_state["margins_data"].get('equity', {}).get('available', {}).get('live_balance', 0)},
                     {"Category": "Equity - Used", "Value": st.session_state["margins_data"].get('equity', {}).get('utilised', {}).get('overall', 0)},
                     {"Category": "Commodity - Available", "Value": st.session_state["margins_data"].get('commodity', {}).get('available', {}).get('live_balance', 0)},
-                    {"Category": "Commodity - Used", "Value": st.session_state["margins_data'].get('commodity', {}).get('utilised', {}).get('overall', 0)},
+                    {"Category": "Commodity - Used", "Value": st.session_state["margins_data"].get('commodity', {}).get('utilised', {}).get('overall', 0)},
                 ])
                 margins_df["Value"] = margins_df["Value"].apply(lambda x: f"₹{x:,.2f}")
                 st.dataframe(margins_df, use_container_width=True)
@@ -729,6 +579,7 @@ with tab_orders:
                 if order_id_action:
                     try:
                         with st.spinner(f"Cancelling order {order_id_action}..."):
+                            # Assuming 'regular' variety for simplicity; in a real app, this would be dynamic
                             res = k.cancel_order(variety="regular", order_id=order_id_action)
                             st.success(f"Order {order_id_action} cancelled successfully!")
                             st.json(res)
@@ -786,6 +637,7 @@ with tab_market:
 
         with st.expander("Load Instruments for Symbol Lookup (Required)"):
             exchange_for_lookup = st.selectbox("Exchange to load instruments for lookup", ["NSE", "BSE", "NFO", "CDS", "MCX"], index=0, key="hist_inst_load_exchange_selector")
+            # Only load explicitly if button clicked, no auto-load on general page rerun
             if st.button("Load Instruments into Cache", key="load_inst_cache_btn"): 
                 inst_df = load_instruments(k, exchange_for_lookup)
                 st.session_state["instruments_df"] = inst_df
@@ -934,6 +786,7 @@ with tab_ml:
 
                     fig_indicators.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MACD'], mode='lines', name='MACD Line', line=dict(color='blue')), row=3, col=1)
                     fig_indicators.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MACD_signal'], mode='lines', name='Signal Line', line=dict(color='red')), row=3, col=1)
+                    # Use MACD_hist for histogram bars
                     fig_indicators.add_trace(go.Bar(x=df_plot.index, y=df_plot['MACD_hist'], name='MACD Histogram', marker_color='gray'), row=3, col=1)
 
                     fig_indicators.add_trace(go.Scatter(x=df_plot.index, y=df_plot['Bollinger_Width'], mode='lines', name='BB Width', line=dict(color='purple')), row=4, col=1)
@@ -1003,6 +856,7 @@ with tab_ml:
                                             model.fit(X_train, y_train)
                                             y_pred = model.predict(X_test)
 
+                                        # Consolidate session state assignments
                                         st.session_state["ml_model"] = model
                                         st.session_state["y_test"] = y_test
                                         st.session_state["y_pred"] = y_pred
@@ -1028,6 +882,7 @@ with tab_ml:
                                             template="plotly_white", hovermode="x unified")
                         st.plotly_chart(fig_pred, use_container_width=True)
 
+                        # Feature Importance for tree-based models
                         if st.session_state.get("ml_model_type") in ["Random Forest Regressor", "LightGBM Regressor"]:
                             st.markdown("##### Feature Importance")
                             model = st.session_state["ml_model"]
@@ -1095,6 +950,7 @@ with tab_ml:
                         )
                         df_backtest['Position'] = df_backtest['Signal'].diff()
 
+                        # Calculate strategy returns
                         df_backtest['Strategy_Return'] = df_backtest['Daily_Return'] * df_backtest['Signal'].shift(1)
                         df_backtest['Cumulative_Strategy_Return'] = (1 + df_backtest['Strategy_Return'] / 100).cumprod() - 1
                         df_backtest['Cumulative_Buy_Hold_Return'] = (1 + df_backtest['Daily_Return'] / 100).cumprod() - 1
@@ -1130,6 +986,7 @@ with tab_ml:
                                                        template="plotly_white", hovermode="x unified", height=450)
                             st.plotly_chart(fig_backtest, use_container_width=True)
 
+                            # Visualize trades
                             fig_trades = make_subplots(rows=1, cols=1, shared_xaxes=True, 
                                                        vertical_spacing=0.03, 
                                                        specs=[[{"secondary_y": False}]])
@@ -1142,6 +999,7 @@ with tab_ml:
                             fig_trades.add_trace(go.Scatter(x=df_backtest.index, y=df_backtest['SMA_Short_BT'], mode='lines', name=f'SMA {short_ma}', line=dict(color='orange', width=1)), row=1, col=1)
                             fig_trades.add_trace(go.Scatter(x=df_backtest.index, y=df_backtest['SMA_Long_BT'], mode='lines', name=f'SMA {long_ma}', line=dict(color='purple', width=1)), row=1, col=1)
 
+                            # Plot buy signals
                             fig_trades.add_trace(go.Scatter(
                                 x=df_backtest.index[df_backtest['Position'] == 1],
                                 y=df_backtest['close'][df_backtest['Position'] == 1],
@@ -1149,6 +1007,7 @@ with tab_ml:
                                 marker=dict(symbol='triangle-up', size=10, color='green', line=dict(width=1, color='DarkSlateGrey')),
                                 name='Buy Signal'
                             ), row=1, col=1)
+                            # Plot sell signals
                             fig_trades.add_trace(go.Scatter(
                                 x=df_backtest.index[df_backtest['Position'] == -1],
                                 y=df_backtest['close'][df_backtest['Position'] == -1],
@@ -1237,8 +1096,10 @@ with tab_risk:
                 confidence_level = st.slider("Confidence Level (%)", min_value=90, max_value=99, value=95, step=1, key="risk_confidence_level")
                 holding_period_var = st.number_input("Holding Period for VaR (days)", min_value=1, value=1, step=1, key="risk_holding_period_var")
                 
+                # Calculate VaR using the historical percentile method
                 var_percentile_1day = np.percentile(daily_returns, 100 - confidence_level)
                 
+                # Scale 1-day VaR for multiple days (simplified assumption: returns are independent and identically distributed)
                 var_percentile_multiday = var_percentile_1day * np.sqrt(holding_period_var)
 
                 st.write(f"With **{confidence_level}% confidence**, the maximum expected loss over **{holding_period_var} day(s)** is:")
@@ -1266,6 +1127,7 @@ with tab_risk:
             
             col_stress_controls, col_stress_results = st.columns([1,2])
             with col_stress_controls:
+                # Pre-defined scenarios
                 scenarios = {
                     "Historical Worst Day Drop": {"type": "historical", "percent": daily_returns.min() if not daily_returns.empty else 0},
                     "Global Financial Crisis (-20%)": {"type": "fixed", "percent": -20.0},
@@ -1317,7 +1179,7 @@ with tab_risk:
 
 
 # ---------------------------
-# TAB: PERFORMANCE ANALYSIS
+# TAB: PERFORMANCE ANALYSIS (NEW!)
 # ---------------------------
 with tab_performance:
     st.header("Performance Analysis")
@@ -1334,6 +1196,7 @@ with tab_performance:
         else:
             st.subheader(f"Performance Metrics for {last_symbol}")
 
+            # Ensure data is ready
             historical_data['close'] = pd.to_numeric(historical_data['close'], errors='coerce')
             returns_series = historical_data['close'].pct_change().dropna() * 100
             
@@ -1357,6 +1220,7 @@ with tab_performance:
                 st.subheader("Cumulative Returns Comparison")
                 fig_cum_returns = go.Figure()
 
+                # Instrument Cumulative Returns
                 cumulative_instrument_returns = (1 + returns_series / 100).cumprod() - 1
                 fig_cum_returns.add_trace(go.Scatter(x=cumulative_instrument_returns.index, 
                                                      y=cumulative_instrument_returns * 100, 
@@ -1364,6 +1228,7 @@ with tab_performance:
                                                      name=f'{last_symbol} Cumulative Returns',
                                                      line=dict(color='blue', width=2)))
                 
+                # Benchmark comparison (using yfinance for NIFTY 50 as an example)
                 st.markdown("---")
                 st.subheader("Benchmark Comparison (e.g., NIFTY 50)")
                 benchmark_symbol = st.text_input("Benchmark Symbol (e.g., ^NSEI for NIFTY 50 from Yahoo Finance)", "^NSEI", key="perf_benchmark_symbol")
@@ -1394,9 +1259,7 @@ with tab_performance:
                                         beta = covariance / benchmark_variance if benchmark_variance != 0 else np.nan
 
                                         annual_asset_return = (1 + performance_metrics['Annualized Return (%)'] / 100)
-                                        annual_benchmark_return_raw = calculate_performance_metrics(benchmark_returns_aligned)['Annualized Return (%)']
-                                        annual_benchmark_return = (1 + annual_benchmark_return_raw / 100)
-
+                                        annual_benchmark_return = (1 + calculate_performance_metrics(benchmark_returns_aligned)['Annualized Return (%)'] / 100)
 
                                         alpha_annual = (annual_asset_return - (1 + risk_free_rate/100) - beta * (annual_benchmark_return - (1 + risk_free_rate/100))) * 100 if not np.isnan(beta) else np.nan
 
@@ -1418,7 +1281,7 @@ with tab_performance:
                 st.plotly_chart(fig_cum_returns, use_container_width=True)
 
 # ---------------------------
-# TAB: MULTI-ASSET ANALYSIS
+# TAB: MULTI-ASSET ANALYSIS (NEW!)
 # ---------------------------
 with tab_multi_asset:
     st.header("Multi-Asset Analysis: Correlation & Diversification")
@@ -1511,6 +1374,78 @@ with tab_multi_asset:
             st.info("Assets with low or negative correlation are good candidates for diversification, as they may reduce overall portfolio risk.")
 
 # ---------------------------
+# TAB: CUSTOM INDEX CREATION (New Tab for this functionality)
+# ---------------------------
+with tab_custom_index:
+    st.header("📊 Custom Index Creation")
+    st.markdown("Create a custom index by uploading a CSV file of its constituents with specified weights. The index value will be calculated based on live market prices.")
+
+    if not k:
+        st.info("Login first to create and calculate a custom index.")
+    else:
+        uploaded_file = st.file_uploader("Upload CSV with columns: symbol, Name, Weights", type=["csv"], key="index_upload_csv")
+        
+        if uploaded_file:
+            try:
+                df = pd.read_csv(uploaded_file)
+                required_cols = {"symbol", "Name", "Weights"}
+                if not required_cols.issubset(set(df.columns)):
+                    st.error(f"CSV must contain columns: {required_cols}. Please correct your CSV file and re-upload.")
+                else:
+                    df["Weights"] = pd.to_numeric(df["Weights"], errors='coerce')
+                    df.dropna(subset=["Weights"], inplace=True)
+                    if df["Weights"].sum() == 0:
+                        st.error("Sum of weights cannot be zero. Please ensure valid weights in your CSV.")
+                    else:
+                        # Normalize weights to sum to 1
+                        df["Weights"] = df["Weights"] / df["Weights"].sum()
+                        st.info(f"Successfully loaded {len(df)} constituents. Normalized weights to sum to 1.")
+
+                        # Fetch live prices
+                        st.subheader("Fetching Live Prices for Constituents...")
+                        quotes = {}
+                        fetch_progress = st.progress(0)
+                        status_text = st.empty()
+                        
+                        for i, sym in enumerate(df["symbol"]):
+                            status_text.text(f"Fetching price for {sym} ({i+1}/{len(df)})...")
+                            try:
+                                # Assuming NSE exchange for simplicity, could be a user input
+                                q = k.quote(f"NSE:{sym}")
+                                last_price = q.get(f"NSE:{sym}", {}).get("last_price")
+                                if last_price is not None:
+                                    quotes[sym] = last_price
+                                else:
+                                    quotes[sym] = np.nan # Use NaN if price not found
+                                    st.warning(f"Could not fetch live price for {sym}. Setting to NaN.")
+                            except Exception as e:
+                                quotes[sym] = np.nan
+                                st.warning(f"Error fetching price for {sym}: {e}. Setting to NaN.")
+                            fetch_progress.progress((i + 1) / len(df))
+                        
+                        fetch_progress.empty()
+                        status_text.empty()
+
+                        df["Last Price"] = df["symbol"].map(quotes)
+                        df["Weighted Price"] = df["Last Price"] * df["Weights"]
+
+                        index_value = df["Weighted Price"].sum()
+
+                        st.subheader("📈 Index Constituents with Live Prices")
+                        st.dataframe(df.style.format({
+                            "Weights": "{:.4f}",
+                            "Last Price": "₹{:,.2f}",
+                            "Weighted Price": "₹{:,.2f}"
+                        }), use_container_width=True)
+
+                        st.success(f"✅ Current Custom Index Value: **₹{index_value:.2f}**")
+
+            except pd.errors.EmptyDataError:
+                st.error("The uploaded CSV file is empty.")
+            except Exception as e:
+                st.error(f"Error processing file or calculating index: {e}. Please ensure the CSV format is correct and contains valid numeric data for weights.")
+
+# ---------------------------
 # TAB: WEBSOCKET (Ticker)
 # ---------------------------
 with tab_ws:
@@ -1520,6 +1455,7 @@ with tab_ws:
     if not k:
         st.info("Login first to start websocket.")
     else:
+        # session state for ticker & ticks
         if "kt_ticker" not in st.session_state:
             st.session_state["kt_ticker"] = None
         if "kt_thread" not in st.session_state:
@@ -1528,10 +1464,11 @@ with tab_ws:
             st.session_state["kt_running"] = False
         if "kt_ticks" not in st.session_state:
             st.session_state["kt_ticks"] = []
-        if "kt_live_prices" not in st.session_state:
+        if "kt_live_prices" not in st.session_state: # For live plot
             st.session_state["kt_live_prices"] = pd.DataFrame(columns=['timestamp', 'last_price', 'instrument_token'])
 
         with st.expander("Lookup Instrument Token for WebSocket Subscription"):
+            # Autoload instruments if not already loaded, for convenience in getting tokens
             if st.session_state.get("instruments_df", pd.DataFrame()).empty:
                 st.info("Loading instruments for NSE to facilitate instrument token lookup for WebSocket.")
                 nse_instruments = load_instruments(k, "NSE") 
@@ -1550,8 +1487,8 @@ with tab_ws:
                     instrument_token_for_ws = find_instrument_token(st.session_state["instruments_df"], ws_tradingsymbol, ws_exchange)
                     if instrument_token_for_ws:
                         st.success(f"Found instrument_token for {ws_tradingsymbol}: **{instrument_token_for_ws}**")
-                        st.session_state["ws_instrument_token_input"] = str(instrument_token_for_ws)
-                        st.session_state["ws_instrument_name"] = ws_tradingsymbol
+                        st.session_state["ws_instrument_token_input"] = str(instrument_token_for_ws) # Store as string for input
+                        st.session_state["ws_instrument_name"] = ws_tradingsymbol # Store name for plot title
                     else:
                         st.warning(f"Could not find instrument token for {ws_tradingsymbol} on {ws_exchange}.")
                 else:
@@ -1571,7 +1508,7 @@ with tab_ws:
                     
                     try:
                         kt = KiteTicker(user_id, access_token, API_KEY)
-                    except Exception: # Fallback for older KiteTicker constructor or if user_id isn't directly needed
+                    except Exception:
                         kt = KiteTicker(API_KEY, access_token)
 
                     st.session_state["kt_ticker"] = kt
@@ -1603,10 +1540,12 @@ with tab_ws:
                             t["_ts"] = datetime.utcnow().isoformat()
                             st.session_state["kt_ticks"].append(t)
                             
+                            # Update live prices for plotting (only for full mode ticks with last_price)
                             if 'last_price' in t and 'instrument_token' in t:
                                 new_row = pd.DataFrame([{'timestamp': datetime.now(), 'last_price': t['last_price'], 'instrument_token': t['instrument_token']}])
-                                if len(st.session_state["kt_live_prices"]) > 500:
-                                    st.session_state["kt_live_prices"] = st.session_state["kt_live_prices"].iloc[1:]
+                                # Append efficiently without full dataframe re-creation if possible, or limit size
+                                if len(st.session_state["kt_live_prices"]) > 500: # Limit history for plot
+                                    st.session_state["kt_live_prices"] = st.session_state["kt_live_prices"].iloc[1:] # Drop oldest
                                 st.session_state["kt_live_prices"] = pd.concat([st.session_state["kt_live_prices"], new_row], ignore_index=True)
                         
                         if len(st.session_state["kt_ticks"]) > 200:
@@ -1631,7 +1570,7 @@ with tab_ws:
                         try:
                             kt.connect(threaded=True)
                             while st.session_state["kt_running"]:
-                                time.sleep(0.1)
+                                time.sleep(0.1) # Small sleep to yield to other threads/Streamlit
                         except Exception as e:
                             st.session_state["kt_ticks"].append({"event": "fatal_error", "error": str(e)})
                             st.session_state["kt_running"] = False
@@ -1666,8 +1605,10 @@ with tab_ws:
         st.subheader("Live Price Chart (First Subscribed Token)")
         live_chart_placeholder = st.empty()
         
+        # Continuously update the live chart
         if st.session_state.get("kt_running") and not st.session_state["kt_live_prices"].empty:
             df_live = st.session_state["kt_live_prices"]
+            # Filter for the first token subscribed (or primary token if multiple)
             if not df_live.empty:
                 first_token = df_live['instrument_token'].iloc[0]
                 df_live_filtered = df_live[df_live['instrument_token'] == first_token]
@@ -1676,6 +1617,7 @@ with tab_ws:
                     fig_live = go.Figure()
                     fig_live.add_trace(go.Scatter(x=df_live_filtered['timestamp'], y=df_live_filtered['last_price'], mode='lines+markers', name='Last Price', line=dict(color='blue')))
                     
+                    # Try to get instrument name from session state
                     inst_name = st.session_state.get("ws_instrument_name", f"Token {first_token}")
                     fig_live.update_layout(title_text=f"Live LTP for {inst_name}",
                                         xaxis_title="Time",
@@ -1695,207 +1637,15 @@ with tab_ws:
         st.subheader("Latest Ticks Data Table")
         tick_data_placeholder = st.empty()
         
+        # This block will re-run automatically due to `_last_tick_update` in on_ticks
         ticks = st.session_state.get("kt_ticks", [])
         if ticks:
-            df_ticks = pd.json_normalize(ticks[-100:][::-1])
+            df_ticks = pd.json_normalize(ticks[-100:][::-1]) # Show most recent 100 ticks
             display_cols = ['_ts', 'instrument_token', 'last_price', 'ohlc.open', 'ohlc.high', 'ohlc.low', 'ohlc.close', 'volume', 'change']
             available_cols = [col for col in display_cols if col in df_ticks.columns]
             tick_data_placeholder.dataframe(df_ticks[available_cols], use_container_width=True)
         else:
             tick_data_placeholder.write("No ticks yet. Start ticker and/or subscribe tokens.")
-
-# ---------------------------
-# TAB: SAVED INDICES (Integrated with Supabase)
-# ---------------------------
-with tab_saved_indices:
-    st.header("💾 Saved Custom Indices")
-    st.markdown("Create and manage your custom indices. Fetches live values and provides historical snapshots.")
-
-    user = supabase_current_user()
-    if not user:
-        st.info("Login to Supabase in the sidebar to view, create, and manage your saved custom indices.")
-    else:
-        user_id = get_user_id(user)
-        if not user_id:
-            st.error("Could not retrieve user ID from Supabase session. Please try logging out and in again.")
-            st.stop()
-
-        tab_create_index, tab_view_indices = st.tabs(["Create New Custom Index", "View & Manage My Indices"])
-
-        with tab_create_index:
-            st.subheader("Create a New Custom Index")
-            uploaded_file = st.file_uploader("Upload CSV with columns: `symbol`, `Name`, `Weights`", type=["csv"], key="create_index_csv_uploader")
-            
-            if uploaded_file:
-                try:
-                    df_upload = pd.read_csv(uploaded_file)
-                    required = {"symbol", "Name", "Weights"}
-                    if not required.issubset(set(df_upload.columns)):
-                        st.error(f"CSV must contain columns: {required}. Found: {set(df_upload.columns)}")
-                    else:
-                        df_upload["symbol"] = df_upload["symbol"].astype(str).str.upper().str.strip()
-                        df_upload["Weights"] = pd.to_numeric(df_upload["Weights"], errors="coerce")
-                        
-                        if df_upload["Weights"].isnull().any():
-                            st.error("Some Weights could not be parsed. Please check the 'Weights' column in your CSV.")
-                        elif df_upload["Weights"].sum() <= 0:
-                            st.error("Total weights must be positive to calculate percentages.")
-                        else:
-                            df_upload["Weights"] = df_upload["Weights"] / df_upload["Weights"].sum()
-                            
-                            st.info("Fetching live prices for index components...")
-                            if not k:
-                                st.warning("Kite Connect not logged in. Cannot fetch live prices for index components.")
-                                df_upload["Last Price"] = np.nan
-                            else:
-                                prices = batch_fetch_prices(k, df_upload["symbol"].tolist(), sleep_between=0.12)
-                                df_upload["Last Price"] = df_upload["symbol"].map(prices)
-                                if df_upload["Last Price"].isnull().any():
-                                    missing_syms = df_upload[df_upload["Last Price"].isnull()]["symbol"].tolist()
-                                    st.warning(f"Could not fetch live prices for: {', '.join(missing_syms)}. These will not contribute to the index value.")
-
-                            df_upload["Weighted Price"] = df_upload["Last Price"] * df_upload["Weights"]
-                            index_value = float(df_upload["Weighted Price"].sum(skipna=True))
-                            
-                            st.dataframe(df_upload.style.format({"Weights": "{:.2%}", "Last Price": "{:,.2f}", "Weighted Price": "{:,.2f}"}))
-                            st.markdown(f"### Current Computed Index Value: **{index_value:,.4f}**")
-
-                            idx_name = st.text_input("Index name", value="My Custom Index", key="new_custom_index_name")
-                            if st.button("💾 Save Custom Index & Snapshot", key="save_custom_index_btn"):
-                                try:
-                                    symbols_json = df_upload[["symbol","Name","Weights"]].to_dict(orient="records")
-                                    idx_res = supabase.table("indices").insert({
-                                        "user_id": user_id,
-                                        "name": idx_name,
-                                        "symbols": json.dumps(symbols_json),
-                                        "last_value": index_value
-                                    }).execute()
-
-                                    index_id = None
-                                    if idx_res.data and len(idx_res.data) > 0:
-                                        index_id = idx_res.data[0]["id"]
-                                    
-                                    if index_id:
-                                        calc_details = df_upload[["symbol","Last Price","Weights","Weighted Price"]].to_dict(orient="records")
-                                        supabase.table("index_calculations").insert({
-                                            "index_id": index_id,
-                                            "value": index_value,
-                                            "details": json.dumps(calc_details)
-                                        }).execute()
-                                        st.success("Custom Index & initial snapshot saved successfully!")
-                                        st.rerun()
-                                    else:
-                                        st.error("Failed to retrieve index ID after saving. Snapshot not saved.")
-                                except Exception as e:
-                                    st.error(f"Failed to save index: {pretty_error(e)}")
-                except Exception as e:
-                    st.error(f"Error processing CSV: {pretty_error(e)}")
-
-        with tab_view_indices:
-            st.subheader("My Saved Custom Indices")
-            try:
-                resp = supabase.table("indices").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
-                rows = resp.data
-                
-                if not rows:
-                    st.info("No saved custom indices yet. Go to 'Create New Custom Index' tab to add one.")
-                else:
-                    for r in rows:
-                        last_value_display = f"{r.get('last_value', 'N/A'):,.4f}" if isinstance(r.get('last_value'), (int, float)) else "N/A"
-                        updated_at_display = r.get('updated_at', r['created_at'])
-                        if updated_at_display:
-                            updated_at_display = updated_at_display.split('.')[0].replace('T', ' ')
-                        else:
-                            updated_at_display = "Unknown"
-
-                        with st.expander(f"**{r['name']}** — Current Value: {last_value_display} (Last updated: {updated_at_display})"):
-                            st.subheader("Index Composition:")
-                            try:
-                                symbols_data = json.loads(r["symbols"])
-                                symbols_df = pd.DataFrame(symbols_data)
-                                if not symbols_df.empty:
-                                    symbols_df["Weights"] = symbols_df["Weights"].apply(lambda x: f"{x:.2%}")
-                                    st.dataframe(symbols_df.style.format(), use_container_width=True)
-                                else:
-                                    st.info("No symbols defined for this index.")
-                            except json.JSONDecodeError:
-                                st.error("Invalid JSON format for index symbols. Data might be corrupted.")
-                                st.text(r["symbols"])
-                            
-                            st.markdown("---")
-                            col_index_actions1, col_index_actions2, col_index_actions3 = st.columns(3)
-
-                            with col_index_actions1:
-                                if st.button("View History", key=f"hist_{r['id']}"):
-                                    try:
-                                        calcs_resp = supabase.table("index_calculations").select("*").eq("index_id", r["id"]).order("calculated_at", desc=True).limit(50).execute()
-                                        calcs = calcs_resp.data
-                                        if calcs:
-                                            st.subheader("Calculation History")
-                                            for c in calcs:
-                                                calc_time_display = c['calculated_at'].split('.')[0].replace('T', ' ')
-                                                with st.expander(f"Snapshot Value: {c['value']:,.4f} at {calc_time_display}"):
-                                                    try:
-                                                        details_df = pd.DataFrame(json.loads(c.get("details", "[]")))
-                                                        st.dataframe(details_df.style.format({"Last Price": "{:,.2f}", "Weights": "{:.2%}", "Weighted Price": "{:,.2f}"}), use_container_width=True)
-                                                    except json.JSONDecodeError:
-                                                        st.error("Invalid JSON format for calculation details.")
-                                                        st.text(c.get("details", "{}"))
-                                        else:
-                                            st.info("No calculation history found for this index.")
-                                    except Exception as e:
-                                        st.error(f"Failed to fetch history: {pretty_error(e)}")
-
-                            with col_index_actions2:
-                                if st.button("Recalculate now (live)", key=f"recalc_{r['id']}"):
-                                    if not k:
-                                        st.error("Kite Connect not logged in. Cannot fetch live prices for recalculation.")
-                                    else:
-                                        try:
-                                            st.info("Recalculating live value for index...")
-                                            symbols_raw = json.loads(r["symbols"])
-                                            syms_for_recalc = [s["symbol"] for s in symbols_raw]
-                                            
-                                            prices_recalc = batch_fetch_prices(k, syms_for_recalc, sleep_between=0.12)
-                                            
-                                            rows_df_recalc = pd.DataFrame(symbols_raw)
-                                            rows_df_recalc["Last Price"] = rows_df_recalc["symbol"].map(prices_recalc)
-
-                                            missing_prices_recalc = rows_df_recalc[rows_df_recalc["Last Price"].isnull()]["symbol"].tolist()
-                                            if missing_prices_recalc:
-                                                st.warning(f"Could not fetch live prices for {', '.join(missing_prices_recalc)} during recalculation. These will not contribute.")
-                                            
-                                            rows_df_recalc["Weighted Price"] = rows_df_recalc["Last Price"] * rows_df_recalc["Weights"]
-                                            new_index_value = float(rows_df_recalc["Weighted Price"].sum(skipna=True))
-                                            
-                                            calc_details_recalc = rows_df_recalc[["symbol", "Last Price", "Weights", "Weighted Price"]].to_dict(orient="records")
-                                            
-                                            supabase.table("index_calculations").insert({
-                                                "index_id": r["id"],
-                                                "value": new_index_value,
-                                                "details": json.dumps(calc_details_recalc)
-                                            }).execute()
-                                            
-                                            supabase.table("indices").update({"last_value": new_index_value, "updated_at": "now()"}).eq("id", r["id"]).execute()
-                                            
-                                            st.success(f"Recalculated & saved snapshot — New Index Value: {new_index_value:,.4f}")
-                                            st.rerun() # Use st.rerun()
-                                        except Exception as e:
-                                            st.error(f"Recalculation failed: {pretty_error(e)}")
-
-                            with col_index_actions3:
-                                if st.button("Delete Index", key=f"del_{r['id']}"):
-                                    try:
-                                        st.warning("Deleting index and all its historical snapshots...")
-                                        supabase.table("index_calculations").delete().eq("index_id", r["id"]).execute()
-                                        supabase.table("indices").delete().eq("id", r["id"]).execute()
-                                        st.success(f"Index '{r['name']}' and all its snapshots deleted.")
-                                        st.rerun() # Use st.rerun()
-                                    except Exception as e:
-                                        st.error(f"Failed to delete index: {pretty_error(e)}. Check RLS policies.")
-            except Exception as e:
-                st.error(f"Failed to fetch saved indices: {pretty_error(e)}. Ensure Supabase RLS policies allow read access for `indices` and `index_calculations` tables for the logged-in user.")
-
 
 # ---------------------------
 # TAB: INSTRUMENTS UTILS
@@ -1904,50 +1654,46 @@ with tab_inst:
     st.header("Instrument Lookup and Utilities")
     st.markdown("Find instrument tokens, which are essential for fetching historical data or subscribing to live market data.")
     
-    if not k:
-        st.info("Login to Kite Connect to use instrument utilities.")
-    else:
-        inst_exchange = st.selectbox("Select Exchange to Load Instruments", ["NSE", "BSE", "NFO", "CDS", "MCX"], index=0, key="inst_utils_exchange_selector")
-        if st.button("Load Instruments for Selected Exchange (cached)", key="inst_utils_load_instruments_btn", help="Fetching instruments can take a moment, especially for large exchanges. Data is cached."):
-            try:
-                df = load_instruments(k, inst_exchange)
-                st.session_state["instruments_df"] = df
-                if not df.empty:
-                    st.success(f"Loaded {len(df)} instruments for {inst_exchange}.")
-                else:
-                    st.warning(f"Could not load instruments for {inst_exchange}. Check API permissions or if the exchange has instruments available.")
-            except Exception as e:
-                st.error(f"Failed to load instruments: {e}")
+    inst_exchange = st.selectbox("Select Exchange to Load Instruments", ["NSE", "BSE", "NFO", "CDS", "MCX"], index=0, key="inst_utils_exchange_selector")
+    if st.button("Load Instruments for Selected Exchange (cached)", key="inst_utils_load_instruments_btn", help="Fetching instruments can take a moment, especially for large exchanges. Data is cached."):
+        try:
+            df = load_instruments(k, inst_exchange)
+            st.session_state["instruments_df"] = df
+            if not df.empty:
+                st.success(f"Loaded {len(df)} instruments for {inst_exchange}.")
+            else:
+                st.warning(f"Could not load instruments for {inst_exchange}. Check API permissions or if the exchange has instruments available.")
+        except Exception as e:
+            st.error(f"Failed to load instruments: {e}")
 
-        df_instruments = st.session_state.get("instruments_df", pd.DataFrame())
-        if not df_instruments.empty:
-            st.subheader("Search Instrument Token by Symbol")
-            col_search_inst, col_search_results = st.columns([1,2])
-            with col_search_inst:
-                search_symbol = st.text_input(f"Enter Tradingsymbol (e.g., INFY for {inst_exchange})", value="INFY", key="inst_utils_search_sym")
-                search_exchange = st.selectbox("Specify Exchange for Search", ["NSE", "BSE", "NFO", "CDS", "MCX"], index=0, key="inst_utils_search_ex")
-                
-                if st.button("Find Token", key="inst_utils_find_token_btn"):
-                    token = find_instrument_token(df_instruments, search_symbol, search_exchange)
-                    if token:
-                        st.session_state["last_found_token"] = token
-                        st.session_state["last_found_symbol"] = search_symbol
-                        st.session_state["last_found_exchange"] = search_exchange
-                        st.success(f"Found instrument_token for {search_symbol} on {search_exchange}: **{token}**")
-                    else:
-                        st.warning(f"Instrument token not found for '{search_symbol}' on '{search_exchange}'. Ensure correct symbol/exchange and that instruments for this exchange are loaded.")
+    df_instruments = st.session_state.get("instruments_df", pd.DataFrame())
+    if not df_instruments.empty:
+        st.subheader("Search Instrument Token by Symbol")
+        col_search_inst, col_search_results = st.columns([1,2])
+        with col_search_inst:
+            search_symbol = st.text_input(f"Enter Tradingsymbol (e.g., INFY for {inst_exchange})", value="INFY", key="inst_utils_search_sym")
+            search_exchange = st.selectbox("Specify Exchange for Search", ["NSE", "BSE", "NFO", "CDS", "MCX"], index=0, key="inst_utils_search_ex")
             
-            with col_search_results:
-                if st.session_state.get("last_found_token"):
-                    st.markdown("##### Details for Last Found Instrument")
-                    token_details = df_instruments[df_instruments['instrument_token'] == st.session_state["last_found_token"]]
-                    if not token_details.empty:
-                        st.dataframe(token_details, use_container_width=True)
-                    else:
-                        st.info("No detailed data for the last found token.")
+            if st.button("Find Token", key="inst_utils_find_token_btn"):
+                token = find_instrument_token(df_instruments, search_symbol, search_exchange)
+                if token:
+                    st.session_state["last_found_token"] = token
+                    st.session_state["last_found_symbol"] = search_symbol
+                    st.session_state["last_found_exchange"] = search_exchange
+                    st.success(f"Found instrument_token for {search_symbol} on {search_exchange}: **{token}**")
+                else:
+                    st.warning(f"Instrument token not found for '{search_symbol}' on '{search_exchange}'. Ensure correct symbol/exchange and that instruments for this exchange are loaded.")
+        
+        with col_search_results:
+            if st.session_state.get("last_found_token"):
+                st.markdown("##### Details for Last Found Instrument")
+                token_details = df_instruments[df_instruments['instrument_token'] == st.session_state["last_found_token"]]
+                if not token_details.empty:
+                    st.dataframe(token_details, use_container_width=True)
+                else:
+                    st.info("No detailed data for the last found token.")
 
-            st.subheader("Preview Loaded Instruments (First 200 Rows)")
-            st.dataframe(df_instruments.head(200), use_container_width=True)
-        else:
-            st.info("No instruments loaded. Click 'Load Instruments for Selected Exchange' above to fetch.")
-```
+        st.subheader("Preview Loaded Instruments (First 200 Rows)")
+        st.dataframe(df_instruments.head(200), use_container_width=True)
+    else:
+        st.info("No instruments loaded. Click 'Load Instruments for Selected Exchange' above to fetch.")
