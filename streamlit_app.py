@@ -117,7 +117,8 @@ def load_instruments_cached(api_key: str, access_token: str, exchange: str = Non
     """Returns pandas.DataFrame of instrument data, using an internally created Kite instance."""
     kite_instance = get_authenticated_kite_client(api_key, access_token)
     if not kite_instance:
-        return pd.DataFrame({"_error": "Kite not authenticated to load instruments."})
+        # Return an empty DataFrame with an error indicator
+        return pd.DataFrame({"_error": ["Kite not authenticated to load instruments."]})
     try:
         instruments = kite_instance.instruments(exchange) if exchange else kite_instance.instruments()
         df = pd.DataFrame(instruments)
@@ -125,7 +126,7 @@ def load_instruments_cached(api_key: str, access_token: str, exchange: str = Non
             df["instrument_token"] = df["instrument_token"].astype("int64")
         return df
     except Exception as e:
-        return pd.DataFrame({"_error": f"Failed to load instruments for {exchange or 'all exchanges'}: {e}"})
+        return pd.DataFrame({"_error": [f"Failed to load instruments for {exchange or 'all exchanges'}: {e}"]})
 
 @st.cache_data(ttl=60) # Cache LTP for 1 minute
 def get_ltp_price_cached(api_key: str, access_token: str, symbol: str, exchange: str = DEFAULT_EXCHANGE):
@@ -151,7 +152,7 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
     # Load instruments for token lookup (this calls the *cached* load_instruments_cached)
     instruments_df = load_instruments_cached(api_key, access_token, exchange)
     if "_error" in instruments_df.columns:
-        return pd.DataFrame({"_error": [instruments_df.get('_error', "Failed to load instruments for token lookup.")]})
+        return pd.DataFrame({"_error": [instruments_df.loc[0, '_error']]}) # Access the error message correctly
 
     token = find_instrument_token(instruments_df, symbol, exchange)
     if not token:
@@ -276,7 +277,8 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
         if isinstance(hist_df, pd.DataFrame) and "_error" not in hist_df.columns and not hist_df.empty:
             all_historical_closes[symbol] = hist_df['close']
         else:
-            st.warning(f"Could not fetch historical data for {symbol}. Skipping for historical calculation. Error: {hist_df.get('_error', 'Unknown')}")
+            error_msg = hist_df.get('_error', ['Unknown error'])[0] if isinstance(hist_df, pd.DataFrame) else 'Unknown error'
+            st.warning(f"Could not fetch historical data for {symbol}. Skipping for historical calculation. Error: {error_msg}")
         progress_bar_placeholder.progress((i + 1) / len(constituents_df))
 
     progress_text_placeholder.empty()
@@ -676,7 +678,7 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
     col_market_quote1, col_market_quote2 = st.columns([1, 2])
     with col_market_quote1:
         q_exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO"], key="market_exchange_tab")
-        q_symbol = st.text_input("Tradingsymbol", value="NIFTY 50", key="market_symbol_tab")
+        q_symbol = st.text_input("Tradingsymbol", value="NIFTY 50", key="market_symbol_tab") # Default to NIFTY 50 for quick demo
         if st.button("Get Market Data", key="get_market_data_btn"):
             ltp_data = get_ltp_price_cached(api_key, access_token, q_symbol, q_exchange) # Use cached LTP
             if ltp_data and "_error" not in ltp_data:
