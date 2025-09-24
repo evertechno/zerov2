@@ -21,7 +21,7 @@ from supabase import create_client, Client
 
 # --- Streamlit Page Configuration ---
 st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
-st.title("Kite Connect (Zerodha) — Advanced Financial Analysis")
+st.title("Invsion Connect")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
 # --- Global Constants & Session State Initialization ---
