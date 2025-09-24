@@ -1181,20 +1181,23 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     # Align dates and normalize benchmark
                     # Make sure 'close' column exists before trying to select it
                     if 'close' in bench_hist_df.columns:
-                        aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df[['close']], left_index=True, right_index=True, how='inner', suffixes=('', '_bench'))
+                        # Rename the 'close' column in bench_hist_df explicitly before merging
+                        bench_hist_df_renamed = bench_hist_df[['close']].rename(columns={'close': f'{bench_symbol}_close_bench'})
+                        
+                        aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df_renamed, left_index=True, right_index=True, how='inner')
+                        
                         if not aligned_df.empty:
-                            # IMPORTANT: Check if 'close_bench' column exists after merge
-                            if 'close_bench' in aligned_df.columns:
-                                # Normalize benchmark to the same base as custom index
+                            benchmark_col_name = f'{bench_symbol}_close_bench'
+                            if benchmark_col_name in aligned_df.columns: # Verify column exists after merge
                                 base_index_val = aligned_df['index_value'].iloc[0]
-                                base_bench_val = aligned_df['close_bench'].iloc[0]
+                                base_bench_val = aligned_df[benchmark_col_name].iloc[0]
                                 if base_bench_val != 0:
-                                    aligned_df[f'{bench_symbol}_normalized'] = (aligned_df['close_bench'] / base_bench_val) * base_index_val
+                                    aligned_df[f'{bench_symbol}_normalized'] = (aligned_df[benchmark_col_name] / base_bench_val) * base_index_val
                                     fig_index_perf.add_trace(go.Scatter(x=aligned_df.index, y=aligned_df[f'{bench_symbol}_normalized'], mode='lines', name=f'Benchmark: {bench_symbol}', line=dict(dash='dash')))
                                 else:
                                     st.warning(f"First historical value of {bench_symbol} is zero, cannot normalize. Skipping benchmark.")
                             else:
-                                st.warning(f"Benchmark '{bench_symbol}' data missing 'close_bench' column after merge. This can happen if merge failed or data is insufficient. Skipping benchmark.")
+                                st.warning(f"Benchmark '{bench_symbol}' data missing expected column '{benchmark_col_name}' after merge. Skipping benchmark.")
                         else:
                             st.warning(f"No common historical data between custom index and benchmark {bench_symbol}. Skipping benchmark.")
                     else:
