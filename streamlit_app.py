@@ -74,10 +74,8 @@ def fetch_last_price(kite: KiteConnect, symbol: str, exchange_prefix="NSE") -> O
         key = f"{exchange_prefix}:{symbol}"
         if q and key in q and "last_price" in q[key]:
             return float(q[key]["last_price"])
-        # st.warning(f"No last price found for {symbol} in quote data.") # Commented out to avoid excessive warnings
         return None
     except Exception as e:
-        # st.error(f"Error fetching price for {symbol}: {e}") # Debugging
         return None
 
 def batch_fetch_prices(kite: KiteConnect, syms: List[str], exchange_prefix="NSE", sleep_between=0.15) -> Dict[str, Optional[float]]:
@@ -113,13 +111,13 @@ if not current_supabase_user:
             try:
                 res = supabase.auth.sign_in_with_password({"email": email, "password": password})
                 
-                if res.user: # User object is directly on the response
+                if res.user:
                     st.session_state["supabase_session"] = res.session
                     st.session_state["supabase_user"] = res.user
                     st.experimental_rerun()
                 else:
                     error_msg = "Unknown error during login."
-                    if res.error: # Error object is directly on the response
+                    if res.error:
                         error_msg = res.error.message
                     st.sidebar.error(f"Login failed: {error_msg}")
             except Exception as e:
@@ -132,7 +130,7 @@ if not current_supabase_user:
             try:
                 res = supabase.auth.sign_up({"email": email, "password": password})
                 
-                if res.user: # User object is directly on the response (even if unconfirmed)
+                if res.user:
                     st.sidebar.info("Signup created successfully. Please check your email to confirm your account before logging in.")
                 else:
                     error_msg = "Unknown error during signup."
@@ -160,8 +158,11 @@ else:
 st.markdown("### Step 1 — Kite Login (Zerodha)")
 st.markdown(f"[🔗 Open Kite login]({kite_login_url})", unsafe_allow_html=True)
 
-query_request_token = st.experimental_get_query_params().get("request_token")
-request_token = query_request_token[0] if query_request_token else None
+# --- REPLACEMENT STARTS HERE ---
+# Use st.query_params to get query parameters
+query_request_token = st.query_params.get("request_token")
+request_token = query_request_token # st.query_params directly returns the value, no need for [0]
+# --- REPLACEMENT ENDS HERE ---
 
 if request_token and "kite_access_token" not in st.session_state:
     st.info("Exchanging request_token for access token...")
@@ -171,7 +172,12 @@ if request_token and "kite_access_token" not in st.session_state:
         if access_token:
             st.session_state["kite_access_token"] = access_token
             st.success("Kite access token saved in session.")
-            st.experimental_set_query_params(request_token=None) 
+            # --- REPLACEMENT STARTS HERE ---
+            # Update query_params to remove request_token
+            # st.query_params.update() can be used to set/unset
+            if "request_token" in st.query_params:
+                del st.query_params["request_token"]
+            # --- REPLACEMENT ENDS HERE ---
             st.experimental_rerun()
         else:
             st.error("No access token returned from Kite.")
