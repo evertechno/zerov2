@@ -57,6 +57,8 @@ if "kt_live_prices" not in st.session_state:
     st.session_state["kt_live_prices"] = pd.DataFrame(columns=['timestamp', 'last_price', 'instrument_token'])
 if "kt_status_message" not in st.session_state:
     st.session_state["kt_status_message"] = "Not started"
+if "_rerun_ws" not in st.session_state: # Flag for WebSocket UI updates
+    st.session_state["_rerun_ws"] = False
 
 
 # --- Load Credentials from Streamlit Secrets ---
@@ -87,6 +89,7 @@ def init_supabase_client(url: str, key: str) -> Client:
 supabase: Client = init_supabase_client(SUPABASE_CREDENTIALS["url"], SUPABASE_CREDENTIALS["anon_key"])
 
 # --- KiteConnect Client Initialization (Unauthenticated for login URL) ---
+# This client is only used for the initial login URL generation and session generation.
 @st.cache_resource(ttl=3600)
 def init_kite_unauth_client(api_key: str) -> KiteConnect:
     return KiteConnect(api_key=api_key)
@@ -94,11 +97,25 @@ def init_kite_unauth_client(api_key: str) -> KiteConnect:
 kite_unauth_client = init_kite_unauth_client(KITE_CREDENTIALS["api_key"])
 login_url = kite_unauth_client.login_url()
 
+
 # --- Utility Functions ---
 
+# Helper to create an authenticated KiteConnect instance
+# This is NOT cached, but its output is used by cached functions and direct API calls.
+def get_authenticated_kite_client(api_key: str | None, access_token: str | None) -> KiteConnect | None:
+    if api_key and access_token:
+        k_instance = KiteConnect(api_key=api_key)
+        k_instance.set_access_token(access_token)
+        return k_instance
+    return None
+
+
 @st.cache_data(ttl=86400, show_spinner="Loading instruments...") # Cache for 24 hours
-def load_instruments(kite_instance: KiteConnect, exchange: str = None) -> pd.DataFrame:
-    """Returns pandas.DataFrame of instrument data."""
+def load_instruments_cached(api_key: str, access_token: str, exchange: str = None) -> pd.DataFrame:
+    """Returns pandas.DataFrame of instrument data, using an internally created Kite instance."""
+    kite_instance = get_authenticated_kite_client(api_key, access_token)
+    if not kite_instance:
+        return pd.DataFrame({"error": "Kite not authenticated to load instruments."})
     try:
         instruments = kite_instance.instruments(exchange) if exchange else kite_instance.instruments()
         df = pd.DataFrame(instruments)
@@ -106,41 +123,41 @@ def load_instruments(kite_instance: KiteConnect, exchange: str = None) -> pd.Dat
             df["instrument_token"] = df["instrument_token"].astype("int64")
         return df
     except Exception as e:
-        st.error(f"Failed to load instruments for {exchange or 'all exchanges'}: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame({"error": f"Failed to load instruments for {exchange or 'all exchanges'}: {e}"})
 
 @st.cache_data(ttl=60) # Cache LTP for 1 minute
-def get_ltp_price_cached(kite_instance: KiteConnect, symbol: str, exchange: str = DEFAULT_EXCHANGE):
+def get_ltp_price_cached(api_key: str, access_token: str, symbol: str, exchange: str = DEFAULT_EXCHANGE):
+    """Fetches LTP for a symbol, using an internally created Kite instance."""
+    kite_instance = get_authenticated_kite_client(api_key, access_token)
+    if not kite_instance:
+        return {"error": "Kite not authenticated to fetch LTP."}
+    
     exchange_symbol = f"{exchange.upper()}:{symbol.upper()}"
     try:
         ltp_data = kite_instance.ltp([exchange_symbol])
         return ltp_data.get(exchange_symbol)
     except Exception as e:
-        st.error(f"Error fetching LTP for {exchange_symbol}: {e}")
-        return None
-
-def find_instrument_token(df: pd.DataFrame, tradingsymbol: str, exchange: str = DEFAULT_EXCHANGE) -> int | None:
-    if df.empty:
-        return None
-    mask = (df.get("exchange", "").str.upper() == exchange.upper()) & \
-           (df.get("tradingsymbol", "").str.upper() == tradingsymbol.upper())
-    hits = df[mask]
-    return int(hits.iloc[0]["instrument_token"]) if not hits.empty else None
+        return {"error": str(e)}
 
 @st.cache_data(ttl=3600) # Cache historical data for 1 hour
-def get_historical_data_cached(kite_instance: KiteConnect, symbol: str, from_date: datetime.date, to_date: datetime.date, interval: str, exchange: str = DEFAULT_EXCHANGE) -> pd.DataFrame:
+def get_historical_data_cached(api_key: str, access_token: str, symbol: str, from_date: datetime.date, to_date: datetime.date, interval: str, exchange: str = DEFAULT_EXCHANGE) -> pd.DataFrame:
+    """Fetches historical data for a symbol, using an internally created Kite instance."""
+    kite_instance = get_authenticated_kite_client(api_key, access_token)
+    if not kite_instance:
+        return pd.DataFrame({"error": "Kite not authenticated to fetch historical data."})
+
+    # Load instruments for token lookup (this calls the *cached* load_instruments_cached)
+    instruments_df = load_instruments_cached(api_key, access_token, exchange)
+    if "error" in instruments_df.columns:
+        return pd.DataFrame({"error": instruments_df.get('error', "Failed to load instruments for token lookup.")})
+
+    token = find_instrument_token(instruments_df, symbol, exchange)
+    if not token:
+        return pd.DataFrame({"error": f"Instrument token not found for {symbol} on {exchange}."})
+
+    from_datetime = datetime.combine(from_date, datetime.min.time())
+    to_datetime = datetime.combine(to_date, datetime.max.time())
     try:
-        if st.session_state["instruments_df"].empty:
-            st.session_state["instruments_df"] = load_instruments(kite_instance, exchange)
-            if st.session_state["instruments_df"].empty:
-                return pd.DataFrame({"error": f"Failed to load instruments for {exchange}."})
-
-        token = find_instrument_token(st.session_state["instruments_df"], symbol, exchange)
-        if not token:
-            return pd.DataFrame({"error": f"Instrument token not found for {symbol} on {exchange}."})
-
-        from_datetime = datetime.combine(from_date, datetime.min.time())
-        to_datetime = datetime.combine(to_date, datetime.max.time())
         data = kite_instance.historical_data(token, from_date=from_datetime, to_date=to_datetime, interval=interval)
         df = pd.DataFrame(data)
         if not df.empty:
@@ -152,6 +169,16 @@ def get_historical_data_cached(kite_instance: KiteConnect, symbol: str, from_dat
         return df
     except Exception as e:
         return pd.DataFrame({"error": str(e)})
+
+
+def find_instrument_token(df: pd.DataFrame, tradingsymbol: str, exchange: str = DEFAULT_EXCHANGE) -> int | None:
+    if df.empty:
+        return None
+    mask = (df.get("exchange", "").str.upper() == exchange.upper()) & \
+           (df.get("tradingsymbol", "").str.upper() == tradingsymbol.upper())
+    hits = df[mask]
+    return int(hits.iloc[0]["instrument_token"]) if not hits.empty else None
+
 
 # No caching for this as it modifies df and generates many dynamic columns
 def add_technical_indicators(df: pd.DataFrame, sma_short=10, sma_long=50, rsi_window=14, macd_fast=12, macd_slow=26, macd_signal=9, bb_window=20, bb_std_dev=2) -> pd.DataFrame:
@@ -243,8 +270,7 @@ with st.sidebar:
             st.sidebar.error(f"Failed to generate Kite session: {e}")
 
     if st.session_state["kite_access_token"]:
-        k = KiteConnect(api_key=KITE_CREDENTIALS["api_key"])
-        k.set_access_token(st.session_state["kite_access_token"])
+        # We now rely on get_authenticated_kite_client(api_key, access_token) for instances
         st.success("Kite Authenticated ✅")
         if st.sidebar.button("Logout from Kite", key="kite_logout_btn"):
             st.session_state["kite_access_token"] = None
@@ -328,12 +354,12 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 3. Quick Data Access (Kite)")
     if st.session_state["kite_access_token"]:
-        k_client = KiteConnect(api_key=KITE_CREDENTIALS["api_key"])
-        k_client.set_access_token(st.session_state["kite_access_token"])
+        # Instantiate KiteConnect only when this section is active and authenticated
+        current_k_client_for_sidebar = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
 
         if st.button("Fetch Current Holdings", key="sidebar_fetch_holdings_btn"):
             try:
-                holdings = k_client.holdings()
+                holdings = current_k_client_for_sidebar.holdings() # Direct call
                 st.session_state["holdings_data"] = pd.DataFrame(holdings)
                 st.success(f"Fetched {len(holdings)} holdings.")
             except Exception as e:
@@ -344,12 +370,13 @@ with st.sidebar:
     else:
         st.info("Login to Kite to access quick data.")
 
+
 # --- Authenticated KiteConnect client (used by main tabs) ---
-if st.session_state["kite_access_token"]:
-    k = KiteConnect(api_key=KITE_CREDENTIALS["api_key"])
-    k.set_access_token(st.session_state["kite_access_token"])
-else:
-    k = None # Ensure k is None if not authenticated
+# This k variable will now be passed to functions that need a KiteConnect instance
+# For functions that need a hashable client for caching, they will internally create one
+# using get_authenticated_kite_client(api_key, access_token)
+k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
+
 
 # --- Main UI - Tabs for modules ---
 tabs = st.tabs(["Dashboard", "Portfolio", "Orders", "Market & Historical", "Machine Learning Analysis", "Risk & Stress Testing", "Performance Analysis", "Multi-Asset Analysis", "Custom Index", "Websocket (stream)", "Instruments Utils"])
@@ -357,7 +384,7 @@ tab_dashboard, tab_portfolio, tab_orders, tab_market, tab_ml, tab_risk, tab_perf
 
 # --- Tab Logic Functions ---
 
-def render_dashboard_tab(kite_client: KiteConnect):
+def render_dashboard_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("Personalized Dashboard")
     st.write("Welcome to your advanced financial analysis dashboard.")
 
@@ -370,8 +397,8 @@ def render_dashboard_tab(kite_client: KiteConnect):
     with col1:
         st.subheader("Account Summary")
         try:
-            profile = kite_client.profile()
-            margins = kite_client.margins()
+            profile = kite_client.profile() # Direct call, not cached
+            margins = kite_client.margins() # Direct call, not cached
             st.metric("Account Holder", profile.get("user_name", "N/A"))
             st.metric("Available Equity Margin", f"₹{margins.get('equity', {}).get('available', {}).get('live_balance', 0):,.2f}")
             st.metric("Available Commodity Margin", f"₹{margins.get('commodity', {}).get('available', {}).get('live_balance', 0):,.2f}")
@@ -380,23 +407,29 @@ def render_dashboard_tab(kite_client: KiteConnect):
 
     with col2:
         st.subheader("Market Insight (NIFTY 50)")
-        nifty_ltp_data = get_ltp_price_cached(kite_client, "NIFTY 50", DEFAULT_EXCHANGE)
-        if nifty_ltp_data:
-            nifty_ltp = nifty_ltp_data.get("last_price", 0.0)
-            nifty_change = nifty_ltp_data.get("change", 0.0)
-            st.metric("NIFTY 50 (LTP)", f"₹{nifty_ltp:,.2f}", delta=f"{nifty_change:.2f}%")
+        if api_key and access_token:
+            nifty_ltp_data = get_ltp_price_cached(api_key, access_token, "NIFTY 50", DEFAULT_EXCHANGE) # Use cached LTP
+            if nifty_ltp_data and "error" not in nifty_ltp_data:
+                nifty_ltp = nifty_ltp_data.get("last_price", 0.0)
+                nifty_change = nifty_ltp_data.get("change", 0.0)
+                st.metric("NIFTY 50 (LTP)", f"₹{nifty_ltp:,.2f}", delta=f"{nifty_change:.2f}%")
+            else:
+                st.warning(f"Could not fetch NIFTY 50 LTP: {nifty_ltp_data.get('error', 'Unknown error')}")
         else:
-            st.warning("Could not fetch NIFTY 50 LTP.")
+            st.info("Kite not authenticated to fetch NIFTY 50 LTP.")
 
         if st.session_state.get("historical_data_NIFTY", pd.DataFrame()).empty:
             if st.button("Load NIFTY 50 Historical for Chart", key="dashboard_load_nifty_hist_btn"):
-                with st.spinner("Fetching NIFTY 50 historical data..."):
-                    nifty_df = get_historical_data_cached(kite_client, "NIFTY 50", datetime.now().date() - timedelta(days=180), datetime.now().date(), "day", DEFAULT_EXCHANGE)
-                    if isinstance(nifty_df, pd.DataFrame) and "error" not in nifty_df.columns:
-                        st.session_state["historical_data_NIFTY"] = nifty_df
-                        st.success("NIFTY 50 historical data loaded.")
-                    else:
-                        st.error(f"Error fetching NIFTY 50 historical: {nifty_df.get('error', 'Unknown error')}")
+                if api_key and access_token:
+                    with st.spinner("Fetching NIFTY 50 historical data..."):
+                        nifty_df = get_historical_data_cached(api_key, access_token, "NIFTY 50", datetime.now().date() - timedelta(days=180), datetime.now().date(), "day", DEFAULT_EXCHANGE)
+                        if isinstance(nifty_df, pd.DataFrame) and "error" not in nifty_df.columns:
+                            st.session_state["historical_data_NIFTY"] = nifty_df
+                            st.success("NIFTY 50 historical data loaded.")
+                        else:
+                            st.error(f"Error fetching NIFTY 50 historical: {nifty_df.get('error', 'Unknown error')}")
+                else:
+                    st.warning("Kite not authenticated to fetch historical data.")
 
         if not st.session_state.get("historical_data_NIFTY", pd.DataFrame()).empty:
             nifty_df = st.session_state["historical_data_NIFTY"]
@@ -420,7 +453,7 @@ def render_dashboard_tab(kite_client: KiteConnect):
         else:
             st.info("Fetch some historical data in 'Market & Historical' tab to see quick performance here.")
 
-def render_portfolio_tab(kite_client: KiteConnect):
+def render_portfolio_tab(kite_client: KiteConnect | None):
     st.header("Your Portfolio Overview")
     if not kite_client:
         st.info("Login first to fetch portfolio data.")
@@ -430,7 +463,7 @@ def render_portfolio_tab(kite_client: KiteConnect):
     with col1:
         if st.button("Fetch Holdings", key="portfolio_fetch_holdings_btn"):
             try:
-                holdings = kite_client.holdings()
+                holdings = kite_client.holdings() # Direct call
                 st.session_state["holdings_data"] = pd.DataFrame(holdings)
                 st.success(f"Fetched {len(holdings)} holdings.")
             except Exception as e:
@@ -444,7 +477,7 @@ def render_portfolio_tab(kite_client: KiteConnect):
     with col2:
         if st.button("Fetch Positions", key="portfolio_fetch_positions_btn"):
             try:
-                positions = kite_client.positions()
+                positions = kite_client.positions() # Direct call
                 st.session_state["net_positions"] = pd.DataFrame(positions.get("net", []))
                 st.session_state["day_positions"] = pd.DataFrame(positions.get("day", []))
                 st.success(f"Fetched positions (Net: {len(positions.get('net', []))}, Day: {len(positions.get('day', []))}).")
@@ -460,7 +493,7 @@ def render_portfolio_tab(kite_client: KiteConnect):
     with col3:
         if st.button("Fetch Margins", key="portfolio_fetch_margins_btn"):
             try:
-                margins = kite_client.margins()
+                margins = kite_client.margins() # Direct call
                 st.session_state["margins_data"] = margins
                 st.success("Fetched margins data.")
             except Exception as e:
@@ -476,7 +509,7 @@ def render_portfolio_tab(kite_client: KiteConnect):
             margins_df["Value"] = margins_df["Value"].apply(lambda x: f"₹{x:,.2f}")
             st.dataframe(margins_df, use_container_width=True)
 
-def render_orders_tab(kite_client: KiteConnect):
+def render_orders_tab(kite_client: KiteConnect | None):
     st.header("Orders — Place, Modify, Cancel & View")
     if not kite_client:
         st.info("Login first to use orders API.")
@@ -510,7 +543,7 @@ def render_orders_tab(kite_client: KiteConnect):
                 if tag: params["tag"] = tag[:20]
 
                 with st.spinner("Placing order..."):
-                    resp = kite_client.place_order(**params)
+                    resp = kite_client.place_order(**params) # Direct call
                     st.success(f"Order placed! ID: {resp.get('order_id')}")
             except Exception as e:
                 st.error(f"Failed to place order: {e}")
@@ -522,7 +555,7 @@ def render_orders_tab(kite_client: KiteConnect):
     with col_view_orders:
         if st.button("Fetch All Orders (Today)", key="fetch_all_orders_btn"):
             try:
-                orders = kite_client.orders()
+                orders = kite_client.orders() # Direct call
                 st.session_state["all_orders"] = pd.DataFrame(orders)
                 st.success(f"Fetched {len(orders)} orders.")
             except Exception as e: st.error(f"Error fetching orders: {e}")
@@ -531,7 +564,7 @@ def render_orders_tab(kite_client: KiteConnect):
 
         if st.button("Fetch All Trades (Today)", key="fetch_all_trades_btn"):
             try:
-                trades = kite_client.trades()
+                trades = kite_client.trades() # Direct call
                 st.session_state["all_trades"] = pd.DataFrame(trades)
                 st.success(f"Fetched {len(trades)} trades.")
             except Exception as e: st.error(f"Error fetching trades: {e}")
@@ -542,7 +575,7 @@ def render_orders_tab(kite_client: KiteConnect):
         order_id_action = st.text_input("Order ID for action", key="order_id_action")
         if st.button("Get Order History", key="get_order_history_btn"):
             if order_id_action:
-                try: st.json(kite_client.order_history(order_id_action))
+                try: st.json(kite_client.order_history(order_id_action)) # Direct call
                 except Exception as e: st.error(f"Failed to get order history: {e}")
             else: st.warning("Provide an Order ID.")
         
@@ -558,20 +591,23 @@ def render_orders_tab(kite_client: KiteConnect):
                         if mod_new_price: modify_args["price"] = float(mod_new_price)
                         if mod_new_qty > 0: modify_args["quantity"] = int(mod_new_qty)
                         if not modify_args: st.warning("No new price or quantity.")
-                        else: st.json(kite_client.modify_order(variety=mod_variety, order_id=order_id_action, **modify_args))
+                        else: st.json(kite_client.modify_order(variety=mod_variety, order_id=order_id_action, **modify_args)) # Direct call
                     except Exception as e: st.error(f"Failed to modify order: {e}")
                 else: st.warning("Provide an Order ID to modify.")
         
         if st.button("Cancel Order", key="cancel_order_btn"):
             if order_id_action:
-                try: st.json(kite_client.cancel_order(variety="regular", order_id=order_id_action))
+                try: st.json(kite_client.cancel_order(variety="regular", order_id=order_id_action)) # Direct call
                 except Exception as e: st.error(f"Failed to cancel order: {e}")
             else: st.warning("Provide an Order ID to cancel.")
 
-def render_market_historical_tab(kite_client: KiteConnect):
+def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("Market Data & Historical Candles")
     if not kite_client:
         st.info("Login first to fetch market data.")
+        return
+    if not api_key or not access_token: # Additional check for cached functions
+        st.info("Kite authentication details required for cached data access.")
         return
 
     st.subheader("Current Market Data Snapshot")
@@ -580,7 +616,7 @@ def render_market_historical_tab(kite_client: KiteConnect):
         q_exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO"], key="market_exchange_tab")
         q_symbol = st.text_input("Tradingsymbol", value="INFY", key="market_symbol_tab")
         if st.button("Get Market Data", key="get_market_data_btn"):
-            ltp_data = get_ltp_price_cached(kite_client, q_symbol, q_exchange)
+            ltp_data = get_ltp_price_cached(api_key, access_token, q_symbol, q_exchange) # Use cached LTP
             if ltp_data and "error" not in ltp_data:
                 st.session_state["current_market_data"] = ltp_data
                 st.success(f"Fetched LTP for {q_symbol}.")
@@ -598,9 +634,13 @@ def render_market_historical_tab(kite_client: KiteConnect):
     with st.expander("Load Instruments for Symbol Lookup (Recommended)"):
         exchange_for_lookup = st.selectbox("Exchange to load instruments", ["NSE", "BSE", "NFO"], key="hist_inst_load_exchange_selector")
         if st.button("Load Instruments into Cache", key="load_inst_cache_btn"):
-            st.session_state["instruments_df"] = load_instruments(kite_client, exchange_for_lookup)
-            if not st.session_state["instruments_df"].empty:
-                st.success(f"Loaded {len(st.session_state['instruments_df'])} instruments.")
+            df_instruments = load_instruments_cached(api_key, access_token, exchange_for_lookup) # Use cached instruments
+            if not df_instruments.empty and "error" not in df_instruments.columns:
+                st.session_state["instruments_df"] = df_instruments
+                st.success(f"Loaded {len(df_instruments)} instruments.")
+            else:
+                st.error(f"Failed to load instruments: {df_instruments.get('error', 'Unknown error')}")
+
 
     col_hist_controls, col_hist_plot = st.columns([1, 2])
     with col_hist_controls:
@@ -612,7 +652,7 @@ def render_market_historical_tab(kite_client: KiteConnect):
 
         if st.button("Fetch Historical Data", key="fetch_historical_data_btn"):
             with st.spinner(f"Fetching {interval} historical data for {hist_symbol}..."):
-                df_hist = get_historical_data_cached(kite_client, hist_symbol, from_date, to_date, interval, hist_exchange)
+                df_hist = get_historical_data_cached(api_key, access_token, hist_symbol, from_date, to_date, interval, hist_exchange) # Use cached historical
                 if isinstance(df_hist, pd.DataFrame) and "error" not in df_hist.columns:
                     st.session_state["historical_data"] = df_hist
                     st.session_state["last_fetched_symbol"] = hist_symbol
@@ -631,7 +671,7 @@ def render_market_historical_tab(kite_client: KiteConnect):
         else:
             st.info("Historical chart will appear here.")
 
-def render_ml_analysis_tab(kite_client: KiteConnect):
+def render_ml_analysis_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("Machine Learning Driven Price Analysis")
     if not kite_client:
         st.info("Login first to perform ML analysis.")
@@ -673,8 +713,6 @@ def render_ml_analysis_tab(kite_client: KiteConnect):
             st.markdown("##### Data with Indicators (Head)")
             st.dataframe(ml_data.head(), use_container_width=True)
             # Plot indicators (abbreviated for brevity, full plot logic from original)
-            # Only generate plot if user explicitly requests or it's crucial for the tab's main purpose
-            # For brevity, let's just show a simple plot, the full subplot is quite large
             fig_indicators = go.Figure(data=[
                 go.Candlestick(x=ml_data.index, open=ml_data['open'], high=ml_data['high'], low=ml_data['low'], close=ml_data['close'], name='Price'),
                 go.Scatter(x=ml_data.index, y=ml_data['SMA_Short'], mode='lines', name='SMA Short'),
@@ -697,12 +735,16 @@ def render_ml_analysis_tab(kite_client: KiteConnect):
             features = [col for col in ml_data_processed.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'target', 'MACD_hist']]
             selected_features = st.multiselect("Select Features for Model", options=features, default=features, key="ml_selected_features_multiselect")
             
-            if not selected_features or X.empty or y.empty: # Check X and y after features are selected
-                st.warning("Select features and ensure enough clean data.")
+            if not selected_features:
+                st.warning("Please select at least one feature.")
                 return
 
             X = ml_data_processed[selected_features]
             y = ml_data_processed['target']
+            
+            if X.empty or y.empty:
+                st.error("Not enough clean data after preprocessing to train the model. Adjust parameters or fetch more data.")
+                return
 
             test_size = st.slider("Test Set Size (%)", 10, 50, 20, step=5) / 100.0
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, shuffle=False)
@@ -792,7 +834,7 @@ def render_ml_analysis_tab(kite_client: KiteConnect):
             st.info("Apply technical indicators first to enable backtesting.")
 
 
-def render_risk_stress_testing_tab(kite_client: KiteConnect):
+def render_risk_stress_testing_tab(kite_client: KiteConnect | None):
     st.header("Risk & Stress Testing Models")
     if not kite_client:
         st.info("Login first to perform risk analysis.")
@@ -873,7 +915,7 @@ def render_risk_stress_testing_tab(kite_client: KiteConnect):
             st.metric("Stressed Price", f"₹{results['stressed_price']:.2f}")
             st.metric("Percentage Change", f"{results['scenario_change_percent']:.2f}%")
 
-def render_performance_analysis_tab(kite_client: KiteConnect):
+def render_performance_analysis_tab(kite_client: KiteConnect | None):
     st.header("Performance Analysis")
     if not kite_client:
         st.info("Login first to analyze performance.")
@@ -934,10 +976,13 @@ def render_performance_analysis_tab(kite_client: KiteConnect):
         fig_cum_returns.update_layout(title_text=f"Cumulative Returns: {last_symbol} vs. Benchmark", height=500)
         st.plotly_chart(fig_cum_returns, use_container_width=True)
 
-def render_multi_asset_analysis_tab(kite_client: KiteConnect):
+def render_multi_asset_analysis_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("Multi-Asset Analysis: Correlation & Diversification")
     if not kite_client:
         st.info("Login first to perform multi-asset analysis.")
+        return
+    if not api_key or not access_token:
+        st.info("Kite authentication details required for cached data access.")
         return
 
     st.subheader("Select Instruments for Analysis")
@@ -950,15 +995,19 @@ def render_multi_asset_analysis_tab(kite_client: KiteConnect):
     to_date_multi = st.date_input("To Date", value=datetime.now().date(), key="to_dt_multi_input")
 
     if st.button("Fetch Multi-Asset Data & Analyze", key="fetch_multi_asset_btn"):
-        if st.session_state["instruments_df"].empty:
-            st.warning("Load instruments first from 'Instruments Utils' tab.")
+        # Load instruments once for all lookups in this tab
+        df_instruments_load = load_instruments_cached(api_key, access_token, multi_asset_exchange)
+        if "error" in df_instruments_load.columns:
+            st.error(f"Failed to load instruments for lookup: {df_instruments_load.get('error', 'Unknown error')}")
             return
+        st.session_state["instruments_df"] = df_instruments_load
+
 
         all_historical_data = {}
         progress_bar = st.progress(0)
         for i, symbol in enumerate(symbols_to_analyze):
             with st.spinner(f"Fetching historical data for {symbol}..."):
-                df = get_historical_data_cached(kite_client, symbol, from_date_multi, to_date_multi, multi_asset_interval, multi_asset_exchange)
+                df = get_historical_data_cached(api_key, access_token, symbol, from_date_multi, to_date_multi, multi_asset_interval, multi_asset_exchange)
                 if not df.empty and "error" not in df.columns:
                     all_historical_data[symbol] = df['close']
                 else:
@@ -990,13 +1039,16 @@ def render_multi_asset_analysis_tab(kite_client: KiteConnect):
         fig_corr_heatmap.update_layout(title_text='Correlation Heatmap', height=600)
         st.plotly_chart(fig_corr_heatmap, use_container_width=True)
 
-def render_custom_index_tab(kite_client: KiteConnect, supabase_client: Client):
+def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Client, api_key: str | None, access_token: str | None):
     st.header("📊 Custom Index Creation")
     if not kite_client:
         st.info("Login to Kite first to fetch live prices for index constituents.")
         return
     if not st.session_state["user_id"]:
         st.info("Login with your Supabase account in the sidebar to save and load custom indexes.")
+        return
+    if not api_key or not access_token:
+        st.info("Kite authentication details required for live price fetching.")
         return
 
     st.subheader("1. Create New Index from CSV")
@@ -1022,9 +1074,9 @@ def render_custom_index_tab(kite_client: KiteConnect, supabase_client: Client):
             quotes = {}
             progress_bar = st.progress(0)
             for i, sym in enumerate(df_constituents["symbol"]):
-                quotes[sym] = get_ltp_price_cached(kite_client, sym, DEFAULT_EXCHANGE) # Use cached LTP
-                if quotes[sym]:
-                    quotes[sym] = quotes[sym].get("last_price", np.nan)
+                ltp_data = get_ltp_price_cached(api_key, access_token, sym, DEFAULT_EXCHANGE) # Use cached LTP
+                if ltp_data and "error" not in ltp_data:
+                    quotes[sym] = ltp_data.get("last_price", np.nan)
                 else:
                     quotes[sym] = np.nan
                     st.warning(f"Could not fetch live price for {sym}. Setting to NaN.")
@@ -1049,7 +1101,7 @@ def render_custom_index_tab(kite_client: KiteConnect, supabase_client: Client):
                         response = supabase_client.table("custom_indexes").insert(index_data).execute()
                         if response.data:
                             st.success(f"Index '{index_name}' saved successfully!")
-                            st.session_state["saved_indexes"] = [] # Clear to force reload
+                            st.session_state["saved_indexes"] = [] # Clear to force reload on next load click
                             st.rerun()
                         else:
                             st.error(f"Failed to save index: {response.data}")
@@ -1091,9 +1143,9 @@ def render_custom_index_tab(kite_client: KiteConnect, supabase_client: Client):
                 recalc_progress = st.progress(0)
                 for i, row in loaded_df.iterrows():
                     sym = row['symbol']
-                    recalc_quotes[sym] = get_ltp_price_cached(kite_client, sym, DEFAULT_EXCHANGE)
-                    if recalc_quotes[sym]:
-                        recalc_quotes[sym] = recalc_quotes[sym].get("last_price", np.nan)
+                    ltp_data = get_ltp_price_cached(api_key, access_token, sym, DEFAULT_EXCHANGE) # Use cached LTP
+                    if ltp_data and "error" not in ltp_data:
+                        recalc_quotes[sym] = ltp_data.get("last_price", np.nan)
                     else:
                         recalc_quotes[sym] = np.nan
                         st.warning(f"Could not fetch live price for {sym} (loaded). Setting to NaN.")
@@ -1119,16 +1171,27 @@ def render_custom_index_tab(kite_client: KiteConnect, supabase_client: Client):
             else: st.error("Selected index data not found.")
     else: st.info("No indexes loaded yet. Click 'Load My Indexes'.")
 
-def render_websocket_tab(kite_client: KiteConnect):
+def render_websocket_tab(kite_client: KiteConnect | None):
     st.header("WebSocket Streaming — Live Ticks")
     if not kite_client:
         st.info("Login first to start websocket.")
         return
 
     with st.expander("Lookup Instrument Token for WebSocket Subscription"):
+        # We need a KiteConnect instance here to load instruments
+        # Use the global `k` if authenticated, or get a temporary one for lookup
+        current_kite_for_lookup = k if k else get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
+        if not current_kite_for_lookup:
+            st.warning("Please authenticate Kite first to lookup instruments.")
+            return
+
         if st.session_state["instruments_df"].empty:
             st.info("Loading instruments for NSE to facilitate lookup.")
-            st.session_state["instruments_df"] = load_instruments(kite_client, DEFAULT_EXCHANGE)
+            df_instruments_load = load_instruments_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], DEFAULT_EXCHANGE)
+            if not df_instruments_load.empty and "error" not in df_instruments_load.columns:
+                st.session_state["instruments_df"] = df_instruments_load
+            else:
+                st.warning(f"Could not load instruments: {df_instruments_load.get('error', 'Unknown error')}")
         
         ws_exchange = st.selectbox("Exchange for Symbol Lookup", ["NSE", "BSE", "NFO"], key="ws_lookup_ex_selector")
         ws_tradingsymbol = st.text_input("Tradingsymbol", value="INFY", key="ws_lookup_sym_input")
@@ -1217,7 +1280,9 @@ def render_websocket_tab(kite_client: KiteConnect):
     live_chart_placeholder = st.empty()
     
     # Live chart and ticks table are continuously updated
-    if st.session_state.get("_rerun_ws", False):
+    # This block needs to be outside any `st.button` or `st.form` to ensure it runs
+    # And we use the `_rerun_ws` flag to trigger a rerun only when new data is available
+    if st.session_state.get("_rerun_ws"):
         st.session_state["_rerun_ws"] = False # Reset flag
         if st.session_state["kt_running"] and not st.session_state["kt_live_prices"].empty:
             df_live = st.session_state["kt_live_prices"]
@@ -1240,24 +1305,33 @@ def render_websocket_tab(kite_client: KiteConnect):
             available_cols = [col for col in display_cols if col in df_ticks.columns]
             st.dataframe(df_ticks[available_cols], use_container_width=True)
         else: st.write("No ticks yet. Start ticker and/or subscribe tokens.")
-        # Schedule a rerun if ticker is still running to refresh data
+        
+        # This is important: schedule a rerun if the ticker is still running
+        # This creates a loop for refreshing the WebSocket UI.
         if st.session_state["kt_running"]:
-            time.sleep(1) # Refresh every 1 second
-            st.experimental_rerun() # This will cause a rerun if data changed
+            time.sleep(1) # Refresh every 1 second (adjust as needed)
+            st.experimental_rerun()
 
-def render_instruments_utils_tab(kite_client: KiteConnect):
+
+def render_instruments_utils_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("Instrument Lookup and Utilities")
     if not kite_client:
         st.info("Login first to use instrument utilities.")
         return
+    if not api_key or not access_token:
+        st.info("Kite authentication details required for cached data access.")
+        return
 
     inst_exchange = st.selectbox("Select Exchange to Load Instruments", ["NSE", "BSE", "NFO", "CDS", "MCX"], key="inst_utils_exchange_selector")
     if st.button("Load Instruments for Selected Exchange (cached)", key="inst_utils_load_instruments_btn"):
-        st.session_state["instruments_df"] = load_instruments(kite_client, inst_exchange)
-        if not st.session_state["instruments_df"].empty:
-            st.success(f"Loaded {len(st.session_state['instruments_df'])} instruments for {inst_exchange}.")
+        df_instruments = load_instruments_cached(api_key, access_token, inst_exchange) # Use cached instruments
+        if not df_instruments.empty and "error" not in df_instruments.columns:
+            st.session_state["instruments_df"] = df_instruments
+            st.success(f"Loaded {len(df_instruments)} instruments for {inst_exchange}.")
+        else:
+            st.error(f"Failed to load instruments: {df_instruments.get('error', 'Unknown error')}")
 
-    df_instruments = st.session_state["instruments_df"]
+    df_instruments = st.session_state["instruments_df"] # Use the potentially updated df from session state
     if not df_instruments.empty:
         st.subheader("Search Instrument Token by Symbol")
         col_search_inst, col_search_results = st.columns([1,2])
@@ -1285,22 +1359,18 @@ def render_instruments_utils_tab(kite_client: KiteConnect):
 
 
 # --- Main Application Logic (Tab Rendering) ---
-with tab_dashboard: render_dashboard_tab(k)
+# Global api_key and access_token to pass to tab functions that use cached utility functions.
+api_key = KITE_CREDENTIALS["api_key"]
+access_token = st.session_state["kite_access_token"]
+
+with tab_dashboard: render_dashboard_tab(k, api_key, access_token)
 with tab_portfolio: render_portfolio_tab(k)
 with tab_orders: render_orders_tab(k)
-with tab_market: render_market_historical_tab(k)
-with tab_ml: render_ml_analysis_tab(k)
+with tab_market: render_market_historical_tab(k, api_key, access_token)
+with tab_ml: render_ml_analysis_tab(k, api_key, access_token)
 with tab_risk: render_risk_stress_testing_tab(k)
 with tab_performance: render_performance_analysis_tab(k)
-with tab_multi_asset: render_multi_asset_analysis_tab(k)
-with tab_custom_index: render_custom_index_tab(k, supabase)
+with tab_multi_asset: render_multi_asset_analysis_tab(k, api_key, access_token)
+with tab_custom_index: render_custom_index_tab(k, supabase, api_key, access_token)
 with tab_ws: render_websocket_tab(k)
-with tab_inst: render_instruments_utils_tab(k)
-
-# --- Manual rerun for WebSocket updates if needed ---
-# This part is a bit tricky with Streamlit's execution model and threads.
-# The _rerun_ws flag combined with st.experimental_rerun() within the tab logic
-# is an attempt to trigger UI updates without blocking the main thread.
-# In a truly "blazing fast" scenario, you might offload more to external services
-# or use advanced Streamlit features like `st.chat_input` for non-blocking UI interactions,
-# but for a self-contained Streamlit app, this pattern is a common compromise.
+with tab_inst: render_instruments_utils_tab(k, api_key, access_token)
