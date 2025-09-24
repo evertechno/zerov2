@@ -14,7 +14,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 import lightgbm as lgb
 import ta  # Technical Analysis library
-# import yfinance as yf  # Removed yfinance dependency
+# import yfinance as yf  # Removed yfinance dependency - using Zerodha API exclusively
 
 # Supabase imports
 from supabase import create_client, Client
@@ -1127,9 +1127,28 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         
         # Recalculate live value (might be slightly different from saved if saved with old prices)
         live_quotes = {}
-        for sym in constituents_df["symbol"]:
-            ltp_data = get_ltp_price_cached(api_key, access_token, sym, DEFAULT_EXCHANGE)
-            live_quotes[sym] = ltp_data.get("last_price", np.nan) if ltp_data and "_error" not in ltp_data else np.nan
+        # Fetch all LTPs in one go if possible, then map
+        symbols_for_ltp = [sym for sym in constituents_df["symbol"]]
+        if symbols_for_ltp:
+            try:
+                # Get the raw KiteConnect client to call the ltp method
+                kc_client = get_authenticated_kite_client(api_key, access_token)
+                if kc_client:
+                    ltp_data_batch = kc_client.ltp([f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp])
+                    for sym in symbols_for_ltp:
+                        key = f"{DEFAULT_EXCHANGE}:{sym}"
+                        if key in ltp_data_batch:
+                            live_quotes[sym] = ltp_data_batch[key].get("last_price", np.nan)
+                        else:
+                            live_quotes[sym] = np.nan # Not found in batch response
+                else:
+                    st.warning("Kite client not available for batch LTP fetch.")
+            except Exception as e:
+                st.error(f"Error fetching batch LTP: {e}. Falling back to individual fetch (might be slower).")
+                # Fallback to individual fetch if batch fails
+                for sym in symbols_for_ltp:
+                    ltp_data = get_ltp_price_cached(api_key, access_token, sym, DEFAULT_EXCHANGE)
+                    live_quotes[sym] = ltp_data.get("last_price", np.nan) if ltp_data and "_error" not in ltp_data else np.nan
         
         constituents_df["Last Price"] = constituents_df["symbol"].map(live_quotes)
         constituents_df["Weighted Price"] = constituents_df["Last Price"] * constituents_df["Weights"]
@@ -1184,11 +1203,13 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         # Rename the 'close' column in bench_hist_df explicitly before merging
                         bench_hist_df_renamed = bench_hist_df[['close']].rename(columns={'close': f'{bench_symbol}_close_bench'})
                         
+                        # Merge with index_history_df
                         aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df_renamed, left_index=True, right_index=True, how='inner')
                         
                         if not aligned_df.empty:
                             benchmark_col_name = f'{bench_symbol}_close_bench'
                             if benchmark_col_name in aligned_df.columns: # Verify column exists after merge
+                                # Normalize benchmark to the same base as custom index
                                 base_index_val = aligned_df['index_value'].iloc[0]
                                 base_bench_val = aligned_df[benchmark_col_name].iloc[0]
                                 if base_bench_val != 0:
@@ -1197,7 +1218,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                                 else:
                                     st.warning(f"First historical value of {bench_symbol} is zero, cannot normalize. Skipping benchmark.")
                             else:
-                                st.warning(f"Benchmark '{bench_symbol}' data missing expected column '{benchmark_col_name}' after merge. Skipping benchmark.")
+                                st.warning(f"Benchmark '{bench_symbol}' data missing expected column '{benchmark_col_name}' after merge. This can happen if merge failed or data is insufficient. Skipping benchmark.")
                         else:
                             st.warning(f"No common historical data between custom index and benchmark {bench_symbol}. Skipping benchmark.")
                     else:
