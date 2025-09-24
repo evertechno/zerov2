@@ -261,13 +261,17 @@ with tab_saved:
                     with st.expander(f"{r['name']} — {r.get('last_value')}"):
                         st.json(json.loads(r["symbols"]))
                         colv1, colv2, colv3 = st.columns([1,1,1])
-                        if colv1.button("View History", key=f"hist_{r['id']}"):
-                            calcs = supabase.table("index_calculations").select("*").eq("index_id", r["id"]).order("calculated_at", desc=True).limit(50).execute().get("data", [])
-                            for c in calcs:
-                                st.write(f"Value: {c['value']} at {c['calculated_at']}")
-                                st.dataframe(pd.DataFrame(json.loads(c.get("details", "[]"))))
-                        if colv2.button("Recalculate now (live)", key=f"recalc_{r['id']}"):
-                            try:
+                        try:
+                            if colv1.button("View History", key=f"hist_{r['id']}"):
+                                calcs = supabase.table("index_calculations").select("*").eq("index_id", r["id"]).order("calculated_at", desc=True).limit(50).execute().get("data", [])
+                                for c in calcs:
+                                    st.write(f"Value: {c['value']} at {c['calculated_at']}")
+                                    st.dataframe(pd.DataFrame(json.loads(c.get("details", "[]"))))
+                        except Exception as e:
+                            st.error(f"Failed to fetch history: {pretty_error(e)}")
+
+                        try:
+                            if colv2.button("Recalculate now (live)", key=f"recalc_{r['id']}"):
                                 symbols = json.loads(r["symbols"])
                                 syms = [s["symbol"] for s in symbols]
                                 prices = batch_fetch_prices(k, syms, sleep_between=0.12)
@@ -283,15 +287,18 @@ with tab_saved:
                                 }).execute()
                                 supabase.table("indices").update({"last_value": value, "updated_at": "now()"}).eq("id", r["id"]).execute()
                                 st.success(f"Recalculated & saved snapshot — {value:.4f}")
-                            except Exception as e:
-                                st.error(f"Recalc failed: {pretty_error(e)}")
-                        if colv3.button("Delete Index", key=f"del_{r['id']}"):
-                            try:
+                        except Exception as e:
+                            st.error(f"Recalc failed: {pretty_error(e)}")
+
+                        try:
+                            if colv3.button("Delete Index", key=f"del_{r['id']}"):
                                 supabase.table("indices").delete().eq("id", r["id"]).execute()
                                 st.success("Deleted index & snapshots. Refresh to update list.")
                                 st.experimental_rerun()
-                            except Exception as e:
-                                st.error(f"Failed to delete: {pretty_error(e)}")
+                        except Exception as e:
+                            st.error(f"Failed to delete: {pretty_error(e)}")
+        except Exception as e:
+            st.error(f"Failed to fetch saved indices: {pretty_error(e)}")
     else:
         st.info("Login to Supabase to view saved indices.")
 
