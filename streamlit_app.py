@@ -14,7 +14,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 import lightgbm as lgb
 import ta  # Technical Analysis library
-import yfinance as yf  # For fetching benchmark data for comparison
+# import yfinance as yf  # Removed yfinance dependency
 
 # Supabase imports
 from supabase import create_client, Client
@@ -260,23 +260,27 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
         return pd.DataFrame({"error": "No constituents provided for historical index calculation."})
 
     all_historical_closes = {}
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
-
+    
+    # Use a single progress bar for all fetches
+    progress_bar_placeholder = st.empty()
+    progress_text_placeholder = st.empty()
+    
     for i, row in constituents_df.iterrows():
         symbol = row['symbol']
         weight = row['Weights']
-        progress_text.text(f"Fetching historical data for {symbol} ({i+1}/{len(constituents_df)})...")
+        progress_text_placeholder.text(f"Fetching historical data for {symbol} ({i+1}/{len(constituents_df)})...")
+        
+        # Use the cached historical data function
         hist_df = get_historical_data_cached(api_key, access_token, symbol, start_date, end_date, "day", exchange)
         
         if isinstance(hist_df, pd.DataFrame) and "error" not in hist_df.columns and not hist_df.empty:
             all_historical_closes[symbol] = hist_df['close']
         else:
             st.warning(f"Could not fetch historical data for {symbol}. Skipping for historical calculation. Error: {hist_df.get('error', 'Unknown')}")
-        progress_bar.progress((i + 1) / len(constituents_df))
+        progress_bar_placeholder.progress((i + 1) / len(constituents_df))
 
-    progress_text.empty()
-    progress_bar.empty()
+    progress_text_placeholder.empty()
+    progress_bar_placeholder.empty()
 
     if not all_historical_closes:
         return pd.DataFrame({"error": "No historical data available for any constituent to build index."})
@@ -292,6 +296,7 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
 
     # Calculate daily weighted prices
     # Ensure weights are aligned correctly
+    # constituents_df should be indexed by 'symbol' for correct alignment
     weighted_closes = combined_closes.mul(constituents_df.set_index('symbol')['Weights'], axis=1)
 
     # Sum the weighted prices for each day to get the index value
@@ -302,11 +307,13 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
         base_value = index_history_series.iloc[0]
         if base_value != 0:
             index_history_df = pd.DataFrame({
-                "date": index_history_series.index,
                 "index_value": (index_history_series / base_value) * 100
-            }).set_index("date")
+            })
+            index_history_df.index.name = 'date' # Ensure index name for later merging/plotting
             return index_history_df
-    return pd.DataFrame({"error": "Error in normalizing historical index values."})
+        else:
+            return pd.DataFrame({"error": "First day's index value is zero, cannot normalize."})
+    return pd.DataFrame({"error": "Error in calculating or normalizing historical index values."})
 
 
 # --- Sidebar: Kite Login ---
@@ -330,7 +337,6 @@ with st.sidebar:
             st.sidebar.error(f"Failed to generate Kite session: {e}")
 
     if st.session_state["kite_access_token"]:
-        # We now rely on get_authenticated_kite_client(api_key, access_token) for instances
         st.success("Kite Authenticated ✅")
         if st.sidebar.button("Logout from Kite", key="kite_logout_btn"):
             st.session_state["kite_access_token"] = None
@@ -701,7 +707,7 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
     col_hist_controls, col_hist_plot = st.columns([1, 2])
     with col_hist_controls:
         hist_exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO"], key="hist_ex_tab_selector")
-        hist_symbol = st.text_input("Tradingsymbol", value="INFY", key="hist_sym_tab_input")
+        hist_symbol = st.text_input("Tradingsymbol", value="NIFTY 50", key="hist_sym_tab_input") # Default to NIFTY 50 for quick demo
         from_date = st.date_input("From Date", value=datetime.now().date() - timedelta(days=90), key="from_dt_tab_input")
         to_date = st.date_input("To Date", value=datetime.now().date(), key="to_dt_tab_input")
         interval = st.selectbox("Interval", ["minute", "5minute", "30minute", "day", "week", "month"], index=3, key="hist_interval_selector")
@@ -1002,13 +1008,16 @@ def render_performance_analysis_tab(kite_client: KiteConnect | None):
         fig_cum_returns.add_trace(go.Scatter(x=cumulative_instrument_returns.index, y=cumulative_instrument_returns * 100, name=f'{last_symbol} Returns'))
         
         st.subheader("Benchmark Comparison (e.g., NIFTY 50)")
-        benchmark_symbol = st.text_input("Benchmark Symbol (Yahoo Finance)", "^NSEI", key="perf_benchmark_symbol")
+        benchmark_symbol = st.text_input("Benchmark Symbol (e.g., NIFTY 50 from Zerodha)", "NIFTY 50", key="perf_benchmark_symbol")
         if st.button("Fetch & Compare Benchmark", key="fetch_compare_benchmark_btn"):
             with st.spinner(f"Fetching {benchmark_symbol} data..."):
                 try:
-                    benchmark_data = yf.download(benchmark_symbol, start=historical_data.index.min().strftime('%Y-%m-%d'), end=historical_data.index.max().strftime('%Y-%m-%d'))
-                    if not benchmark_data.empty and 'Close' in benchmark_data.columns:
-                        benchmark_returns = benchmark_data['Close'].pct_change().dropna() * 100
+                    # Fetch from Zerodha API via our cached function
+                    benchmark_data_df = get_historical_data_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], benchmark_symbol, historical_data.index.min().date(), historical_data.index.max().date(), "day", DEFAULT_EXCHANGE)
+                    
+                    if isinstance(benchmark_data_df, pd.DataFrame) and "error" not in benchmark_data_df.columns and not benchmark_data_df.empty:
+                        benchmark_returns = benchmark_data_df['close'].pct_change().dropna() * 100
+                        # Align dates
                         common_dates = returns_series.index.intersection(benchmark_returns.index)
                         if not common_dates.empty and len(common_dates) > 1:
                             returns_series_aligned = returns_series.loc[common_dates]
@@ -1027,7 +1036,7 @@ def render_performance_analysis_tab(kite_client: KiteConnect | None):
                                 st.metric("Alpha (Annualized %)", f"{alpha_annual:.2f}%" if not np.isnan(alpha_annual) else "N/A")
                             else: st.warning("Not enough common data for Alpha/Beta.")
                         else: st.warning("No common historical data points with benchmark.")
-                    else: st.warning(f"Could not fetch benchmark data for {benchmark_symbol}.")
+                    else: st.warning(f"Could not fetch benchmark data for {benchmark_symbol}: {benchmark_data_df.get('error', 'Unknown error')}")
                 except Exception as e: st.error(f"Error fetching benchmark data: {e}")
         fig_cum_returns.update_layout(title_text=f"Cumulative Returns: {last_symbol} vs. Benchmark", height=500)
         st.plotly_chart(fig_cum_returns, use_container_width=True)
@@ -1149,52 +1158,32 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         fig_index_perf.add_trace(go.Scatter(x=index_history_df.index, y=index_history_df['index_value'], mode='lines', name=f'Custom Index ({index_name})', line=dict(color='blue', width=2)))
         
         # Benchmarking
-        st.markdown("##### Benchmark Comparison")
-        benchmark_symbols_str = st.text_input("Enter Benchmark Symbols (comma-separated, e.g., ^NSEI,NIFTY 50)", value="^NSEI", key=f"benchmark_symbols_{index_id or index_name}")
+        st.markdown("##### Benchmark Comparison (from Zerodha API)")
+        benchmark_symbols_str = st.text_input("Enter Benchmark Symbols (comma-separated, e.g., NIFTY 50,BANKNIFTY)", value="NIFTY 50", key=f"benchmark_symbols_{index_id or index_name}")
         benchmark_symbols = [s.strip().upper() for s in benchmark_symbols_str.split(',') if s.strip()]
+        benchmark_exchange = st.selectbox("Benchmark Exchange", ["NSE", "BSE", "NFO"], key=f"bench_exchange_{index_id or index_name}")
 
         if st.button("Add Benchmarks to Chart", key=f"add_benchmarks_{index_id or index_name}"):
             for bench_symbol in benchmark_symbols:
-                bench_hist_df = pd.DataFrame()
+                with st.spinner(f"Fetching historical data for benchmark {bench_symbol}..."):
+                    bench_hist_df = get_historical_data_cached(api_key, access_token, bench_symbol, index_history_df.index.min().date(), index_history_df.index.max().date(), "day", benchmark_exchange)
                 
-                # Try Yahoo Finance first
-                try:
-                    yf_data = yf.download(bench_symbol, start=index_history_df.index.min().strftime('%Y-%m-%d'), end=index_history_df.index.max().strftime('%Y-%m-%d'))
-                    if not yf_data.empty and 'Close' in yf_data.columns:
-                        bench_hist_df = yf_data['Close'].to_frame()
-                        bench_hist_df.index.name = 'date'
-                        bench_hist_df.rename(columns={'Close': 'value'}, inplace=True)
-                        st.info(f"Fetched {bench_symbol} from Yahoo Finance.")
-                except Exception as e:
-                    st.warning(f"Could not fetch {bench_symbol} from Yahoo Finance: {e}")
-
-                # If not found in Yahoo Finance, try Kite Connect
-                if bench_hist_df.empty:
-                    st.info(f"Attempting to fetch {bench_symbol} from Kite Connect...")
-                    kite_bench_df = get_historical_data_cached(api_key, access_token, bench_symbol, index_history_df.index.min().date(), index_history_df.index.max().date(), "day", DEFAULT_EXCHANGE)
-                    if isinstance(kite_bench_df, pd.DataFrame) and "error" not in kite_bench_df.columns and not kite_bench_df.empty:
-                        bench_hist_df = kite_bench_df['close'].to_frame()
-                        bench_hist_df.rename(columns={'close': 'value'}, inplace=True)
-                        st.info(f"Fetched {bench_symbol} from Kite Connect.")
-                    else:
-                        st.warning(f"Could not fetch {bench_symbol} from Kite Connect: {kite_bench_df.get('error', 'Unknown error')}")
-                
-                if not bench_hist_df.empty:
+                if isinstance(bench_hist_df, pd.DataFrame) and "error" not in bench_hist_df.columns and not bench_hist_df.empty:
                     # Align dates and normalize benchmark
-                    aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df[['value']], left_index=True, right_index=True, how='inner')
+                    aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df[['close']], left_index=True, right_index=True, how='inner', suffixes=('', '_bench'))
                     if not aligned_df.empty:
                         # Normalize benchmark to the same base as custom index
                         base_index_val = aligned_df['index_value'].iloc[0]
-                        base_bench_val = aligned_df['value'].iloc[0]
+                        base_bench_val = aligned_df['close_bench'].iloc[0]
                         if base_bench_val != 0:
-                            aligned_df[f'{bench_symbol}_normalized'] = (aligned_df['value'] / base_bench_val) * base_index_val
+                            aligned_df[f'{bench_symbol}_normalized'] = (aligned_df['close_bench'] / base_bench_val) * base_index_val
                             fig_index_perf.add_trace(go.Scatter(x=aligned_df.index, y=aligned_df[f'{bench_symbol}_normalized'], mode='lines', name=f'Benchmark: {bench_symbol}', line=dict(dash='dash')))
                         else:
                             st.warning(f"First historical value of {bench_symbol} is zero, cannot normalize.")
                     else:
                         st.warning(f"No common historical data between custom index and benchmark {bench_symbol}.")
                 else:
-                    st.warning(f"No historical data obtained for benchmark {bench_symbol}. Skipping.")
+                    st.warning(f"No historical data obtained for benchmark {bench_symbol}. Skipping. Error: {bench_hist_df.get('error', 'Unknown')}")
 
         fig_index_perf.update_layout(title_text=f"Historical Performance: {index_name} vs. Benchmarks",
                                   xaxis_title="Date", yaxis_title="Index Value (Normalized to 100 on Start Date)",
@@ -1333,12 +1322,9 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 # If historical data isn't saved or is empty, re-calculate it live
                 if loaded_historical_df.empty or "error" in loaded_historical_df.columns:
                     st.warning(f"Historical data for '{selected_index_name_from_db}' was not found in DB or is invalid. Recalculating live...")
-                    # Determine date range for recalculation
+                    # Determine date range for recalculation based on current defaults
                     min_date = (datetime.now().date() - timedelta(days=365))
                     max_date = datetime.now().date()
-                    if not loaded_historical_df.empty and "date" in loaded_historical_df.columns:
-                        min_date = loaded_historical_df.index.min().date() # Use historical min if available
-                        max_date = loaded_historical_df.index.max().date() # Use historical max if available
                     
                     with st.spinner("Recalculating historical index values (live)..."):
                         recalculated_historical_df = _calculate_historical_index_value(api_key, access_token, loaded_constituents_df, min_date, max_date, DEFAULT_EXCHANGE)
@@ -1375,7 +1361,6 @@ def render_websocket_tab(kite_client: KiteConnect | None):
 
     with st.expander("Lookup Instrument Token for WebSocket Subscription"):
         # We need a KiteConnect instance here to load instruments
-        # Use the global `k` if authenticated, or get a temporary one for lookup
         current_kite_for_lookup = k if k else get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
         if not current_kite_for_lookup:
             st.warning("Please authenticate Kite first to lookup instruments.")
@@ -1501,9 +1486,8 @@ def render_websocket_tab(kite_client: KiteConnect | None):
         else: st.write("No ticks yet. Start ticker and/or subscribe tokens.")
         
         # This is important: schedule a rerun if the ticker is still running
-        # This creates a loop for refreshing the WebSocket UI.
         if st.session_state["kt_running"]:
-            time.sleep(1) # Refresh every 1 second (adjust as needed)
+            time.sleep(1) # Refresh every 1 second
             st.experimental_rerun()
 
 
