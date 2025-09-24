@@ -285,7 +285,7 @@ with tab_saved:
                                     "value": value,
                                     "details": json.dumps(calc_details)
                                 }).execute()
-                                supabase.table("indices"].update({"last_value": value, "updated_at": "now()"}).eq("id", r["id"]).execute()
+                                supabase.table("indices").update({"last_value": value, "updated_at": "now()"}).eq("id", r["id"]).execute()
                                 st.success(f"Recalculated & saved snapshot — {value:.4f}")
                         except Exception as e:
                             st.error(f"Recalc failed: {pretty_error(e)}")
