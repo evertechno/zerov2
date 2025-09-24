@@ -17,7 +17,6 @@ def load_kite_conf():
         kite_conf = st.secrets["kite"]
         return kite_conf.get("api_key"), kite_conf.get("api_secret"), kite_conf.get("redirect_uri")
     except Exception:
-        # st.error("Kite credentials not found in Streamlit secrets.") # Consider adding this for debugging
         return None, None, None
 
 def load_supabase_conf():
@@ -25,7 +24,6 @@ def load_supabase_conf():
         sb = st.secrets["supabase"]
         return sb.get("url"), sb.get("anon_key")
     except Exception:
-        # st.error("Supabase credentials not found in Streamlit secrets.") # Consider adding this for debugging
         return None, None
 
 API_KEY, API_SECRET, REDIRECT_URI = load_kite_conf()
@@ -58,12 +56,10 @@ def supabase_current_user():
     if user:
         return user
     
+    # Fallback to check if a full session object was stored
     session_response = st.session_state.get("supabase_session")
     if session_response and hasattr(session_response, "user") and session_response.user:
         return session_response.user
-    # Some versions might store session directly as a dict in session_state
-    if isinstance(session_response, dict) and session_response.get("user"):
-        return session_response["user"]
     
     return None
 
@@ -78,7 +74,7 @@ def fetch_last_price(kite: KiteConnect, symbol: str, exchange_prefix="NSE") -> O
         key = f"{exchange_prefix}:{symbol}"
         if q and key in q and "last_price" in q[key]:
             return float(q[key]["last_price"])
-        st.warning(f"No last price found for {symbol} in quote data.") # Added more specific warning
+        # st.warning(f"No last price found for {symbol} in quote data.") # Commented out to avoid excessive warnings
         return None
     except Exception as e:
         # st.error(f"Error fetching price for {symbol}: {e}") # Debugging
@@ -117,17 +113,13 @@ if not current_supabase_user:
             try:
                 res = supabase.auth.sign_in_with_password({"email": email, "password": password})
                 
-                # Check for error in the response data first
-                if res.data and res.data.get("user"):
+                if res.user: # User object is directly on the response
                     st.session_state["supabase_session"] = res.session
-                    st.session_state["supabase_user"] = res.data["user"]
+                    st.session_state["supabase_user"] = res.user
                     st.experimental_rerun()
                 else:
-                    # If user is None, check for error details
                     error_msg = "Unknown error during login."
-                    if res.data and res.data.get("error"):
-                        error_msg = res.data["error"].get("message", error_msg)
-                    elif res.error: # Fallback to res.error if res.data.error is not present
+                    if res.error: # Error object is directly on the response
                         error_msg = res.error.message
                     st.sidebar.error(f"Login failed: {error_msg}")
             except Exception as e:
@@ -140,17 +132,11 @@ if not current_supabase_user:
             try:
                 res = supabase.auth.sign_up({"email": email, "password": password})
                 
-                # Check for error in the response data first
-                if res.data and res.data.get("user"):
-                    # For sign_up, user is often returned even if email confirmation is pending
+                if res.user: # User object is directly on the response (even if unconfirmed)
                     st.sidebar.info("Signup created successfully. Please check your email to confirm your account before logging in.")
-                    # Optionally, you might want to log the user in directly if auto-login after signup is enabled in Supabase
-                    # For now, we inform and expect them to confirm then log in.
                 else:
                     error_msg = "Unknown error during signup."
-                    if res.data and res.data.get("error"):
-                        error_msg = res.data["error"].get("message", error_msg)
-                    elif res.error:
+                    if res.error:
                         error_msg = res.error.message
                     st.sidebar.error(f"Signup failed: {error_msg}")
             except Exception as e:
@@ -163,7 +149,7 @@ else:
         try:
             supabase.auth.sign_out()
         except Exception as e:
-            st.sidebar.warning(f"Logout had a minor issue: {pretty_error(e)}") # Provide feedback even on logout errors
+            st.sidebar.warning(f"Logout had a minor issue: {pretty_error(e)}")
         st.session_state.pop("supabase_session", None)
         st.session_state.pop("supabase_user", None)
         st.experimental_rerun()
@@ -185,10 +171,8 @@ if request_token and "kite_access_token" not in st.session_state:
         if access_token:
             st.session_state["kite_access_token"] = access_token
             st.success("Kite access token saved in session.")
-            # Clear the request_token from query params to prevent re-exchange on refresh
-            # This is important to avoid issues if the user refreshes the page
             st.experimental_set_query_params(request_token=None) 
-            st.experimental_rerun() # Rerun to remove the request_token from URL and update UI
+            st.experimental_rerun()
         else:
             st.error("No access token returned from Kite.")
     except Exception as e:
@@ -198,8 +182,6 @@ if "kite_access_token" not in st.session_state:
     st.warning("Login to Kite via the link above to fetch live quotes.")
     st.stop()
 
-# Initialize KiteConnect client with access token for the rest of the app
-# This needs to be done *after* we are sure kite_access_token exists
 k = KiteConnect(api_key=API_KEY)
 k.set_access_token(st.session_state["kite_access_token"])
 
@@ -301,7 +283,6 @@ with tab_create:
                                         "last_value": index_value
                                     }).execute()
 
-                                    # Check for successful insertion and get the ID
                                     index_id = None
                                     if idx_res.data and len(idx_res.data) > 0:
                                         index_id = idx_res.data[0]["id"]
@@ -315,7 +296,6 @@ with tab_create:
                                             "details": json.dumps(calc_details)
                                         }).execute()
                                         st.success(f"Index '{idx_name}' and initial snapshot saved successfully!")
-                                        st.session_state["saved_index_rerun"] = True # Trigger rerun for saved tab
                                         st.experimental_rerun()
                                     else:
                                         st.error("Failed to retrieve index ID after saving definition. Snapshot not saved.")
@@ -346,8 +326,7 @@ with tab_saved:
                     last_value_display = f"{r.get('last_value', 'N/A'):,.4f}" if isinstance(r.get('last_value'), (int, float)) else "N/A"
                     updated_at_display = r.get('updated_at', r['created_at'])
                     if updated_at_display:
-                        # Format timestamp for better readability, e.g., '2023-10-27T10:30:00.123456+00:00' -> '2023-10-27 10:30'
-                        updated_at_display = updated_at_display.split('.')[0].replace('T', ' ') # Basic formatting
+                        updated_at_display = updated_at_display.split('.')[0].replace('T', ' ')
                     else:
                         updated_at_display = "Unknown"
 
@@ -363,7 +342,7 @@ with tab_saved:
                                 st.info("No symbols defined for this index.")
                         except json.JSONDecodeError:
                             st.error("Invalid JSON format for index symbols. Data might be corrupted.")
-                            st.text(r["symbols"]) # Show raw JSON for debugging
+                            st.text(r["symbols"])
                         
                         st.markdown("---")
                         colv1, colv2, colv3 = st.columns([1, 1, 1])
@@ -423,7 +402,7 @@ with tab_saved:
                                     supabase.table("indices").update({"last_value": new_index_value, "updated_at": "now()"}).eq("id", r["id"]).execute()
                                     
                                     st.success(f"Recalculated & saved snapshot — New Index Value: {new_index_value:,.4f}")
-                                    st.experimental_rerun() # Rerun to update the displayed list of indices
+                                    st.experimental_rerun()
                                 except Exception as e:
                                     st.error(f"Recalculation failed: {pretty_error(e)}")
 
@@ -432,12 +411,10 @@ with tab_saved:
                             if st.button("Delete Index", key=f"del_{r['id']}"):
                                 try:
                                     st.warning("Deleting index and all its historical snapshots...")
-                                    # First delete related calculations to satisfy foreign key constraints
                                     supabase.table("index_calculations").delete().eq("index_id", r["id"]).execute()
-                                    # Then delete the index itself
                                     supabase.table("indices").delete().eq("id", r["id"]).execute()
                                     st.success(f"Index '{r['name']}' and all its snapshots deleted.")
-                                    st.experimental_rerun() # Rerun to refresh the list of indices
+                                    st.experimental_rerun()
                                 except Exception as e:
                                     st.error(f"Failed to delete index: {pretty_error(e)}. Check RLS policies.")
         except Exception as e:
@@ -453,13 +430,12 @@ with tab_account:
     user = supabase_current_user()
     if user:
         st.subheader("Supabase User Info")
-        # Ensure 'user' is a dict before calling .get()
         if isinstance(user, dict):
             st.json(user)
-        elif hasattr(user, '__dict__'): # Handle user objects that might behave like dicts
+        elif hasattr(user, '__dict__'):
             st.json(user.__dict__)
         else:
-            st.write(str(user)) # Fallback
+            st.write(str(user))
     else:
         st.info("Not logged in to Supabase.")
     
