@@ -1,59 +1,4 @@
-# streamlit_kite_app.py
-"""
-PROD-READY Streamlit app integrating:
-- Kite Connect (Zerodha) for market quotes
-- Supabase for Auth + storing indices + calculation snapshots
-
-SQL to run once in Supabase SQL editor (example):
-------------------------------------------------
--- Enable pgcrypto extension for gen_random_uuid() if not present:
-create extension if not exists "pgcrypto";
-
-create table public.indices (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid references auth.users(id) on delete cascade,
-  name text not null,
-  symbols jsonb not null, -- array of {symbol, Name, Weights}
-  last_value numeric,
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
-);
-
-create table public.index_calculations (
-  id uuid primary key default gen_random_uuid(),
-  index_id uuid references public.indices(id) on delete cascade,
-  value numeric not null,
-  details jsonb, -- array of {symbol, LastPrice, Weights, WeightedPrice}
-  calculated_at timestamptz default now()
-);
-
-alter table public.indices enable row level security;
-alter table public.index_calculations enable row level security;
-
-create policy "users can manage their indices"
-on public.indices
-for all
-using (auth.uid() = user_id)
-with check (auth.uid() = user_id);
-
-create policy "users can manage their index_calculations"
-on public.index_calculations
-for all
-using (
-  exists (
-    select 1 from public.indices i
-    where i.id = index_id and i.user_id = auth.uid()
-  )
-)
-with check (
-  exists (
-    select 1 from public.indices i
-    where i.id = index_id and i.user_id = auth.uid()
-  )
-);
-------------------------------------------------
-"""
-
+# streamlit_kite_app_prod.py
 import streamlit as st
 from kiteconnect import KiteConnect
 from supabase import create_client, Client
@@ -106,11 +51,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 def supabase_current_user():
     """Return logged-in supabase user (or None)."""
     try:
-        # supabase.auth.get_session / get_user depends on versions.
         session = supabase.auth.session()
         if session and "user" in session and session["user"]:
             return session["user"]
-        # fallback: sign_in response stored in session_state
         return st.session_state.get("supabase_user")
     except Exception:
         return st.session_state.get("supabase_user")
@@ -119,9 +62,7 @@ def pretty_error(e: Exception) -> str:
     return str(e)
 
 def fetch_last_price(kite: KiteConnect, symbol: str, exchange_prefix="NSE") -> Optional[float]:
-    """Fetch last price for a single symbol; returns None on failure."""
     try:
-        # Kite quote returns nested dict with key like "NSE:INFY"
         q = kite.quote(f"{exchange_prefix}:{symbol}")
         key = f"{exchange_prefix}:{symbol}"
         if q and key in q and "last_price" in q[key]:
@@ -131,19 +72,17 @@ def fetch_last_price(kite: KiteConnect, symbol: str, exchange_prefix="NSE") -> O
         return None
 
 def batch_fetch_prices(kite: KiteConnect, syms: List[str], exchange_prefix="NSE", sleep_between=0.15) -> Dict[str, Optional[float]]:
-    """Simple rate-friendly batch fetcher (one-by-one with tiny sleep to avoid throttle)."""
     out = {}
     for s in syms:
         out[s] = fetch_last_price(kite, s, exchange_prefix=exchange_prefix)
-        time.sleep(sleep_between)  # throttling guard
+        time.sleep(sleep_between)
     return out
 
 # -------------------------
-# UI: Sidebar - Auth
+# Sidebar: Supabase Auth
 # -------------------------
 st.sidebar.header("Authentication")
 
-# Supabase Auth UI (email/password)
 if "supabase_session" not in st.session_state:
     st.session_state["supabase_session"] = None
 
@@ -155,24 +94,20 @@ if not supabase_current_user():
     if col1.button("Login"):
         try:
             res = supabase.auth.sign_in_with_password({"email": email, "password": password})
-            # sign_in_with_password returns dict-like; try to extract user
-            user = res.get("user") if isinstance(res, dict) else None
-            if not user:
-                # some versions return {'data': {'user': ...}, 'error': None}
-                user = (res.get("data") or {}).get("user") if isinstance(res, dict) else None
+            user = res.get("user") if isinstance(res, dict) else (res.get("data") or {}).get("user")
             if user:
                 st.session_state["supabase_session"] = res
                 st.session_state["supabase_user"] = user
                 st.experimental_rerun()
             else:
-                st.sidebar.error("Login response did not contain user. Check credentials.")
+                st.sidebar.error("Login response did not contain user.")
         except Exception as e:
             st.sidebar.error(f"Login failed: {pretty_error(e)}")
 
     if col2.button("Sign up"):
         try:
-            res = supabase.auth.sign_up({"email": email, "password": password})
-            st.sidebar.info("Signup created. Confirm email before login (check your inbox).")
+            supabase.auth.sign_up({"email": email, "password": password})
+            st.sidebar.info("Signup created. Confirm email before login.")
         except Exception as e:
             st.sidebar.error(f"Sign up failed: {pretty_error(e)}")
 
@@ -190,19 +125,14 @@ else:
         st.experimental_rerun()
 
 # -------------------------
-# Kite Login (main area)
+# Kite Login
 # -------------------------
 st.markdown("### Step 1 — Kite Login (Zerodha)")
 st.write("Click the Kite login link below and complete the flow. After login you'll be redirected to your redirect_uri with a `request_token` in query params.")
 st.markdown(f"[🔗 Open Kite login]({kite_login_url})", unsafe_allow_html=True)
 
-# After redirect, streamlit exposes query params; look for request_token
 query_request_token = st.experimental_get_query_params().get("request_token")
-if query_request_token:
-    # query_request_token is a list
-    request_token = query_request_token[0]
-else:
-    request_token = None
+request_token = query_request_token[0] if query_request_token else None
 
 if request_token and "kite_access_token" not in st.session_state:
     st.info("Received request_token — exchanging for access token...")
@@ -212,7 +142,6 @@ if request_token and "kite_access_token" not in st.session_state:
         if access_token:
             st.session_state["kite_access_token"] = access_token
             st.success("Kite access token saved in session.")
-            # Optionally persist token to Supabase (if you want) - ensure encryption & security if storing
         else:
             st.error("No access token returned from Kite.")
     except Exception as e:
@@ -226,61 +155,48 @@ k = KiteConnect(api_key=API_KEY)
 k.set_access_token(st.session_state["kite_access_token"])
 
 # -------------------------
-# Main UI: Tabs
+# Main Tabs
 # -------------------------
-tab = st.tabs(["Dashboard", "Create Index", "Saved Indices", "Account"])[0]  # quick default tab variable
-
-# Use an actual tab UI
 tab_dashboard, tab_create, tab_saved, tab_account = st.tabs(["Dashboard", "Create Index", "Saved Indices", "Account"])
 
 # -------------------------
-# Dashboard tab
+# Dashboard
 # -------------------------
 with tab_dashboard:
     st.header("📊 Dashboard")
-    st.write("Quick quote check / kite account basics.")
     col1, col2 = st.columns([1, 2])
-
     with col1:
         if st.button("👤 Fetch Kite profile"):
             try:
-                profile = k.profile()
-                st.json(profile)
+                st.json(k.profile())
             except Exception as e:
-                st.error(f"Error fetching profile: {pretty_error(e)}")
-
+                st.error(f"Error: {pretty_error(e)}")
         if st.button("📈 Get positions"):
             try:
                 positions = k.positions()
-                st.write("Net positions")
                 st.dataframe(pd.DataFrame(positions.get("net", []) if isinstance(positions, dict) else positions))
             except Exception as e:
-                st.error(f"Error fetching positions: {pretty_error(e)}")
-
+                st.error(f"Error: {pretty_error(e)}")
     with col2:
-        symbol = st.text_input("Quick symbol (eg: INFY)", value="INFY", key="quick_sym")
+        symbol = st.text_input("Quick symbol", value="INFY", key="quick_sym")
         if st.button("Get quote"):
-            try:
-                price = fetch_last_price(k, symbol)
-                if price is None:
-                    st.warning(f"No price available for {symbol}")
-                else:
-                    st.success(f"{symbol} last price: {price}")
-            except Exception as e:
-                st.error(f"Quote error: {pretty_error(e)}")
+            price = fetch_last_price(k, symbol)
+            if price is None:
+                st.warning(f"No price for {symbol}")
+            else:
+                st.success(f"{symbol} last price: {price}")
 
 # -------------------------
-# Create Index tab
+# Create Index
 # -------------------------
 with tab_create:
     st.header("🧩 Create & Save Custom Index")
-
     uploaded_file = st.file_uploader("Upload CSV with columns: symbol, Name, Weights", type=["csv"], key="upload_index_csv")
     if uploaded_file:
         try:
             df = pd.read_csv(uploaded_file)
         except Exception as e:
-            st.error(f"Failed to read CSV: {pretty_error(e)}")
+            st.error(f"CSV read failed: {pretty_error(e)}")
             df = None
 
         if df is not None:
@@ -288,65 +204,45 @@ with tab_create:
             if not required.issubset(set(df.columns)):
                 st.error(f"CSV must contain columns: {required}")
             else:
-                # Clean-up: uppercase symbol, numeric weights
                 df = df.copy()
                 df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
-                # coerce weights numeric
                 df["Weights"] = pd.to_numeric(df["Weights"], errors="coerce")
                 if df["Weights"].isnull().any():
-                    st.error("Some Weights could not be parsed as numbers. Fix CSV and re-upload.")
+                    st.error("Some Weights invalid.")
                 else:
-                    # Normalise weights (sum to 1)
                     total_weight = df["Weights"].sum()
                     if total_weight == 0:
-                        st.error("Sum of Weights is 0. Provide non-zero weights.")
+                        st.error("Sum of Weights is 0.")
                     else:
-                        df["Weights"] = df["Weights"] / total_weight
-
-                        # Fetch live prices (with small throttle)
-                        st.info("Fetching live prices (might take a moment)...")
+                        df["Weights"] /= total_weight
+                        st.info("Fetching live prices...")
                         prices = batch_fetch_prices(k, df["symbol"].tolist(), sleep_between=0.12)
-
                         df["Last Price"] = df["symbol"].map(prices)
-                        # Warn if any None
                         missing = df[df["Last Price"].isnull()]
                         if not missing.empty:
-                            st.warning(f"Could not fetch prices for: {', '.join(missing['symbol'].tolist())}")
-
+                            st.warning(f"Missing prices: {', '.join(missing['symbol'].tolist())}")
                         df["Weighted Price"] = df["Last Price"] * df["Weights"]
                         index_value = float(df["Weighted Price"].sum(skipna=True))
-
                         st.subheader("Index Constituents")
                         st.dataframe(df)
-
                         st.markdown(f"### Current Index Value: **{index_value:.4f}**")
 
-                        # Save options (requires Supabase user)
                         user = supabase_current_user()
-                        if not user:
-                            st.warning("Please login to Supabase (sidebar) to save indices.")
-                        else:
+                        if user:
                             idx_name = st.text_input("Index name", value="My Custom Index", key="index_name_input")
-                            col_save1, col_save2 = st.columns([1, 1])
+                            col_save1, col_save2 = st.columns([1,1])
                             if col_save1.button("💾 Save Index & Snapshot"):
-                                # Prepare payloads
                                 try:
                                     symbols_json = df[["symbol", "Name", "Weights"]].to_dict(orient="records")
-                                    # Insert index definition
                                     insert_idx = supabase.table("indices").insert({
                                         "user_id": user.get("id"),
                                         "name": idx_name,
                                         "symbols": json.dumps(symbols_json),
                                         "last_value": index_value
                                     }).execute()
-                                    # handle result shapes
-                                    idx_data = None
-                                    if isinstance(insert_idx, dict):
-                                        idx_data = (insert_idx.get("data") or [None])[0]
-                                    else:
-                                        idx_data = (insert_idx.data or [None])[0]
+                                    idx_data = (insert_idx.data or [None])[0] if hasattr(insert_idx, "data") else (insert_idx.get("data") or [None])[0]
                                     if not idx_data or "id" not in idx_data:
-                                        st.error("Failed to create index record in Supabase. Check logs/permissions.")
+                                        st.error("Failed to create index.")
                                     else:
                                         index_id = idx_data["id"]
                                         calc_details = df[["symbol", "Last Price", "Weights", "Weighted Price"]].to_dict(orient="records")
@@ -355,121 +251,38 @@ with tab_create:
                                             "value": index_value,
                                             "details": json.dumps(calc_details)
                                         }).execute()
-                                        st.success("Index and calculation snapshot saved.")
+                                        st.success("Index and snapshot saved.")
                                 except Exception as e:
-                                    st.error(f"Failed to save index: {pretty_error(e)}")
-
-                            if col_save2.button("💾 Save Snapshot (to existing index)"):
-                                # Let user pick an existing index to attach snapshot to
-                                try:
-                                    resp = supabase.table("indices").select("*").eq("user_id", user.get("id")).execute()
-                                    rows = resp.data if hasattr(resp, "data") else resp.get("data", [])
-                                    if not rows:
-                                        st.info("No saved indices found; please create one first.")
-                                    else:
-                                        idx_map = {r["name"]: r["id"] for r in rows}
-                                        choice = st.selectbox("Choose index", options=list(idx_map.keys()))
-                                        if choice and st.button("Confirm Save Snapshot"):
-                                            index_id = idx_map[choice]
-                                            calc_details = df[["symbol", "Last Price", "Weights", "Weighted Price"]].to_dict(orient="records")
-                                            supabase.table("index_calculations").insert({
-                                                "index_id": index_id,
-                                                "value": index_value,
-                                                "details": json.dumps(calc_details)
-                                            }).execute()
-                                            # update last_value on indices table
-                                            supabase.table("indices").update({"last_value": index_value, "updated_at": "now()"}).eq("id", index_id).execute()
-                                            st.success("Snapshot saved to existing index.")
-                                except Exception as e:
-                                    st.error(f"Failed saving snapshot: {pretty_error(e)}")
+                                    st.error(f"Save failed: {pretty_error(e)}")
 
 # -------------------------
-# Saved Indices tab
+# Saved Indices
 # -------------------------
 with tab_saved:
-    st.header("💾 Saved Indices (your workspace)")
+    st.header("💾 Saved Indices")
     user = supabase_current_user()
-    if not user:
-        st.info("Login to Supabase (sidebar) to view saved indices.")
-    else:
+    if user:
         try:
             resp = supabase.table("indices").select("*").eq("user_id", user.get("id")).order("created_at", desc=True).execute()
             rows = resp.data if hasattr(resp, "data") else resp.get("data", [])
             if not rows:
-                st.info("No saved indices yet. Create one in 'Create Index' tab.")
+                st.info("No saved indices.")
             else:
-                # Show a simple list and allow actions
                 for r in rows:
-                    with st.expander(f"{r['name']} — last_value: {r.get('last_value')} — created: {r.get('created_at')}"):
-                        st.json(r["symbols"] if isinstance(r["symbols"], (dict, list)) else json.loads(r["symbols"]))
-                        colv1, colv2, colv3 = st.columns([1,1,1])
-                        if colv1.button("View History", key=f"hist_{r['id']}"):
-                            # fetch last 20 calculations
-                            calc_resp = supabase.table("index_calculations").select("*").eq("index_id", r["id"]).order("calculated_at", desc=True).limit(50).execute()
-                            calcs = calc_resp.data if hasattr(calc_resp, "data") else calc_resp.get("data", [])
-                            if not calcs:
-                                st.info("No calculations yet for this index.")
-                            else:
-                                for c in calcs:
-                                    with st.container():
-                                        st.write(f"Value: {c['value']} at {c['calculated_at']}")
-                                        details = c.get("details")
-                                        try:
-                                            dd = details if isinstance(details, (list, dict)) else json.loads(details)
-                                            st.dataframe(pd.DataFrame(dd))
-                                        except Exception:
-                                            st.text(str(details))
-                        if colv2.button("Recalculate now (live)", key=f"recalc_{r['id']}"):
-                            # Recalculate using latest symbols & save snapshot
-                            try:
-                                symbols = r["symbols"]
-                                if isinstance(symbols, str):
-                                    symbols = json.loads(symbols)
-                                syms = [s["symbol"] for s in symbols]
-                                prices = batch_fetch_prices(k, syms, sleep_between=0.12)
-                                rows_df = pd.DataFrame(symbols)
-                                rows_df["Last Price"] = rows_df["symbol"].map(prices)
-                                rows_df["Weighted Price"] = rows_df["Last Price"] * rows_df["Weights"]
-                                value = float(rows_df["Weighted Price"].sum(skipna=True))
-                                calc_details = rows_df[["symbol", "Last Price", "Weights", "Weighted Price"]].to_dict(orient="records")
-                                supabase.table("index_calculations").insert({
-                                    "index_id": r["id"],
-                                    "value": value,
-                                    "details": json.dumps(calc_details)
-                                }).execute()
-                                supabase.table("indices").update({"last_value": value, "updated_at": "now()"}).eq("id", r["id"]).execute()
-                                st.success(f"Recalculated & saved snapshot — Value: {value:.4f}")
-                            except Exception as e:
-                                st.error(f"Recalc failed: {pretty_error(e)}")
-                        if colv3.button("Delete Index", key=f"del_{r['id']}"):
-                            # deletion (will cascade index_calculations)
-                            try:
-                                supabase.table("indices").delete().eq("id", r["id"]).execute()
-                                st.success("Deleted index (and snapshots). Refresh to update list.")
-                                st.experimental_rerun()
-                            except Exception as e:
-                                st.error(f"Failed to delete: {pretty_error(e)}")
+                    with st.expander(f"{r['name']} — {r.get('last_value')}"):
+                        st.json(r["symbols"] if isinstance(r["symbols"], (dict,list)) else json.loads(r["symbols"]))
         except Exception as e:
-            st.error(f"Failed to load saved indices: {pretty_error(e)}")
+            st.error(f"Load failed: {pretty_error(e)}")
+    else:
+        st.info("Login to view saved indices.")
 
 # -------------------------
-# Account tab
+# Account
 # -------------------------
 with tab_account:
-    st.header("👤 Account & App Info")
+    st.header("👤 Account Info")
     user = supabase_current_user()
-    if not user:
-        st.info("Not logged in.")
-    else:
+    if user:
         st.json(user)
-
-    st.markdown("---")
-    st.write("Notes:")
-    st.write("- RLS is expected to be configured on Supabase tables as per SQL in header.")
-    st.write("- For scheduled hourly recalcs, implement an Edge Function + Cron trigger using a service_role key (do NOT put service_role in client).")
-    st.write("- Consider encrypting any persisted Kite access tokens if you store them in Supabase.")
-    st.write("- For heavy usage, switch to batch quote APIs (or instrument token mapping) and implement retry/backoff logic.")
-
-# -------------------------
-# End of file
-# -------------------------
+    else:
+        st.info("Not logged in.")
