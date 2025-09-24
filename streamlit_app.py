@@ -18,6 +18,10 @@ import ta # Technical Analysis library
 import yfinance as yf # For fetching benchmark data for comparison
 import matplotlib.pyplot as plt # Added matplotlib import for pandas styler
 
+# Supabase imports
+from supabase import create_client, Client
+import os
+
 st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
 st.title("Kite Connect (Zerodha) — Advanced Financial Analysis")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
@@ -37,8 +41,28 @@ except Exception:
 
 if not API_KEY or not API_SECRET or not REDIRECT_URI:
     st.error("Missing Kite credentials in Streamlit secrets. Add [kite] api_key, api_secret and redirect_uri in `.streamlit/secrets.toml`.")
-    st.info("Example `secrets.toml`:\n```toml\n[kite]\napi_key=\"YOUR_KITE_API_KEY\"\napi_secret=\"YOUR_KITE_SECRET\"\nredirect_uri=\"http://localhost:8501\"\n```")
+    st.info("Example `secrets.toml`:\n```toml\n[kite]\napi_key=\"YOUR_KITE_API_KEY\"\napi_secret=\"YOUR_KITE_SECRET\"\nredirect_uri=\"http://localhost:8501\"\n\n[supabase]\nurl=\"YOUR_SUPABASE_URL\"\nanon_key=\"YOUR_SUPABASE_ANON_KEY\"\n```")
     st.stop()
+
+try:
+    SUPABASE_URL = st.secrets["supabase"].get("url")
+    SUPABASE_ANON_KEY = st.secrets["supabase"].get("anon_key")
+except Exception:
+    SUPABASE_URL = None
+    SUPABASE_ANON_KEY = None
+
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    st.error("Missing Supabase credentials in Streamlit secrets. Add [supabase] url and anon_key in `.streamlit/secrets.toml`.")
+    st.stop()
+
+# ---------------------------
+# Supabase Client Initialization
+# ---------------------------
+@st.cache_resource
+def init_supabase_client():
+    return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+supabase: Client = init_supabase_client()
 
 # ---------------------------
 # Helper: init unauth client (used for login URL)
@@ -234,31 +258,107 @@ def calculate_performance_metrics(returns_series, risk_free_rate=0.0):
         "Sortino Ratio": sortino_ratio
     }
 
+# ---------------------------
+# Supabase Authentication UI in Sidebar
+# ---------------------------
+st.sidebar.markdown("### Supabase User Account")
+
+if "user_session" not in st.session_state:
+    st.session_state["user_session"] = None
+if "user_id" not in st.session_state:
+    st.session_state["user_id"] = None
+
+def get_current_user_session():
+    try:
+        # This will refresh the session if needed and return it
+        session_data = supabase.auth.get_session()
+        if session_data and session_data.user:
+            st.session_state["user_session"] = session_data
+            st.session_state["user_id"] = session_data.user.id
+            return session_data
+    except Exception:
+        # If there's no active session or an error occurs
+        st.session_state["user_session"] = None
+        st.session_state["user_id"] = None
+    return None
+
+current_supabase_session = get_current_user_session()
+
+if current_supabase_session:
+    st.sidebar.success(f"Logged in as: {current_supabase_session.user.email}")
+    if st.sidebar.button("Logout from Supabase", key="supabase_logout_btn"):
+        try:
+            supabase.auth.sign_out()
+            st.session_state["user_session"] = None
+            st.session_state["user_id"] = None
+            st.sidebar.success("Logged out from Supabase.")
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Error logging out: {e}")
+else:
+    with st.sidebar.form("supabase_auth_form"):
+        st.sidebar.markdown("##### Email/Password Login")
+        email = st.text_input("Email", key="supabase_email_input")
+        password = st.text_input("Password", type="password", key="supabase_password_input")
+        
+        col_auth1, col_auth2 = st.columns(2)
+        with col_auth1:
+            login_submitted = st.form_submit_button("Login")
+        with col_auth2:
+            signup_submitted = st.form_submit_button("Sign Up")
+
+        if login_submitted:
+            if email and password:
+                try:
+                    response = supabase.auth.sign_in_with_password({"email": email, "password": password})
+                    st.session_state["user_session"] = response.session
+                    st.session_state["user_id"] = response.user.id
+                    st.sidebar.success("Login successful! Welcome.")
+                    st.rerun()
+                except Exception as e:
+                    st.sidebar.error(f"Login failed: {e}")
+            else:
+                st.sidebar.warning("Please enter both email and password for login.")
+        
+        if signup_submitted:
+            if email and password:
+                try:
+                    response = supabase.auth.sign_up({"email": email, "password": password})
+                    st.session_state["user_session"] = response.session
+                    st.session_state["user_id"] = response.user.id
+                    st.sidebar.success("Sign up successful! Please check your email to confirm your account.")
+                    st.rerun()
+                except Exception as e:
+                    st.sidebar.error(f"Sign up failed: {e}")
+            else:
+                st.sidebar.warning("Please enter both email and password for sign up.")
 
 # ---------------------------
 # Sidebar for global actions
 # ---------------------------
 with st.sidebar:
-    st.header("Account Info")
+    st.markdown("---")
+    st.header("Kite Account Info")
     if k:
         try:
             profile = k.profile()
-            st.success("Authenticated ✅")
+            st.success("Kite Authenticated ✅")
             st.write(f"**User:** {profile.get('user_name') or profile.get('user_id')}")
             st.write(f"**User ID:** {profile.get('user_id')}")
             st.write(f"**Login time:** {profile.get('login_time').strftime('%Y-%m-%d %H:%M:%S')}")
         except Exception:
-            st.warning("Authenticated, but profile fetch failed (check API permissions).")
+            st.warning("Kite Authenticated, but profile fetch failed (check API permissions).")
 
-        if st.button("Logout (clear token)", key="sidebar_logout_btn", help="This will clear your access token from the session and require re-login."):
+        if st.button("Logout from Kite (clear token)", key="sidebar_logout_btn", help="This will clear your access token from the session and require re-login."):
             st.session_state.pop("kite_access_token", None)
             st.session_state.pop("kite_login_response", None)
-            for key in list(st.session_state.keys()): # Clear all session state for a clean re-run
-                st.session_state.pop(key)
-            st.success("Logged out. Please login again.")
+            for key in list(st.session_state.keys()): # Clear all Kite-related session state for a clean re-run
+                if key.startswith("kite_") or key.startswith("historical_"):
+                    st.session_state.pop(key)
+            st.success("Logged out from Kite. Please login again.")
             st.rerun()
     else:
-        st.info("Not authenticated yet. Please login using the link above.")
+        st.info("Not authenticated with Kite yet. Please login using the link above.")
 
     st.markdown("---")
     st.header("Quick Data Access")
@@ -274,7 +374,7 @@ with st.sidebar:
             with st.expander("Show Holdings"):
                 st.dataframe(st.session_state["holdings_data"])
     else:
-        st.info("Login to access quick data.")
+        st.info("Login to Kite to access quick data.")
 
 
 # ---------------------------
@@ -1102,7 +1202,7 @@ with tab_risk:
                 # Scale 1-day VaR for multiple days (simplified assumption: returns are independent and identically distributed)
                 var_percentile_multiday = var_percentile_1day * np.sqrt(holding_period_var)
 
-                st.write(f"With **{confidence_level}% confidence**, the maximum expected loss over **{holding_period_var} day(s)** is:")
+                st.write(f"With **{confidence_level}% confidence**, the maximum expected loss over **{holding_period_var} day(s)s** is:")
                 st.metric(label=f"VaR ({confidence_level}%)", value=f"{abs(var_percentile_multiday):.2f}%")
 
                 current_price = historical_data['close'].iloc[-1]
@@ -1381,69 +1481,184 @@ with tab_custom_index:
     st.markdown("Create a custom index by uploading a CSV file of its constituents with specified weights. The index value will be calculated based on live market prices.")
 
     if not k:
-        st.info("Login first to create and calculate a custom index.")
-    else:
+        st.info("Login to Kite first to fetch live prices for index constituents.")
+    elif not st.session_state.get("user_id"):
+        st.info("Login with your Supabase account in the sidebar to save and load custom indexes.")
+    else: # Both Kite and Supabase logged in
         uploaded_file = st.file_uploader("Upload CSV with columns: symbol, Name, Weights", type=["csv"], key="index_upload_csv")
         
         if uploaded_file:
             try:
-                df = pd.read_csv(uploaded_file)
+                df_constituents = pd.read_csv(uploaded_file)
                 required_cols = {"symbol", "Name", "Weights"}
-                if not required_cols.issubset(set(df.columns)):
+                if not required_cols.issubset(set(df_constituents.columns)):
                     st.error(f"CSV must contain columns: {required_cols}. Please correct your CSV file and re-upload.")
                 else:
-                    df["Weights"] = pd.to_numeric(df["Weights"], errors='coerce')
-                    df.dropna(subset=["Weights"], inplace=True)
-                    if df["Weights"].sum() == 0:
+                    df_constituents["Weights"] = pd.to_numeric(df_constituents["Weights"], errors='coerce')
+                    df_constituents.dropna(subset=["Weights"], inplace=True)
+                    if df_constituents["Weights"].sum() == 0:
                         st.error("Sum of weights cannot be zero. Please ensure valid weights in your CSV.")
                     else:
-                        # Normalize weights to sum to 1
-                        df["Weights"] = df["Weights"] / df["Weights"].sum()
-                        st.info(f"Successfully loaded {len(df)} constituents. Normalized weights to sum to 1.")
+                        df_constituents["Weights"] = df_constituents["Weights"] / df_constituents["Weights"].sum()
+                        st.info(f"Successfully loaded {len(df_constituents)} constituents. Normalized weights to sum to 1.")
 
-                        # Fetch live prices
                         st.subheader("Fetching Live Prices for Constituents...")
                         quotes = {}
                         fetch_progress = st.progress(0)
                         status_text = st.empty()
                         
-                        for i, sym in enumerate(df["symbol"]):
-                            status_text.text(f"Fetching price for {sym} ({i+1}/{len(df)})...")
+                        for i, sym in enumerate(df_constituents["symbol"]):
+                            status_text.text(f"Fetching price for {sym} ({i+1}/{len(df_constituents)})...")
                             try:
-                                # Assuming NSE exchange for simplicity, could be a user input
                                 q = k.quote(f"NSE:{sym}")
                                 last_price = q.get(f"NSE:{sym}", {}).get("last_price")
                                 if last_price is not None:
                                     quotes[sym] = last_price
                                 else:
-                                    quotes[sym] = np.nan # Use NaN if price not found
+                                    quotes[sym] = np.nan
                                     st.warning(f"Could not fetch live price for {sym}. Setting to NaN.")
                             except Exception as e:
                                 quotes[sym] = np.nan
                                 st.warning(f"Error fetching price for {sym}: {e}. Setting to NaN.")
-                            fetch_progress.progress((i + 1) / len(df))
+                            fetch_progress.progress((i + 1) / len(df_constituents))
                         
                         fetch_progress.empty()
                         status_text.empty()
 
-                        df["Last Price"] = df["symbol"].map(quotes)
-                        df["Weighted Price"] = df["Last Price"] * df["Weights"]
+                        df_constituents["Last Price"] = df_constituents["symbol"].map(quotes)
+                        df_constituents["Weighted Price"] = df_constituents["Last Price"] * df_constituents["Weights"]
 
-                        index_value = df["Weighted Price"].sum()
+                        current_index_value = df_constituents["Weighted Price"].sum()
 
                         st.subheader("📈 Index Constituents with Live Prices")
-                        st.dataframe(df.style.format({
+                        st.dataframe(df_constituents.style.format({
                             "Weights": "{:.4f}",
                             "Last Price": "₹{:,.2f}",
                             "Weighted Price": "₹{:,.2f}"
                         }), use_container_width=True)
 
-                        st.success(f"✅ Current Custom Index Value: **₹{index_value:.2f}**")
+                        st.success(f"✅ Current Custom Index Value: **₹{current_index_value:.2f}**")
+
+                        st.markdown("---")
+                        st.subheader("Save Custom Index to Database")
+                        index_name = st.text_input("Enter a name for your index", key="index_save_name")
+                        if st.button("Save Index", key="save_index_to_db_btn"):
+                            if index_name and st.session_state.get("user_id"):
+                                try:
+                                    # Prepare data for Supabase
+                                    index_data = {
+                                        "user_id": st.session_state["user_id"],
+                                        "index_name": index_name,
+                                        "constituents": df_constituents[['symbol', 'Name', 'Weights']].to_dict(orient='records')
+                                    }
+                                    response = supabase.table("custom_indexes").insert(index_data).execute()
+                                    if response.data:
+                                        st.success(f"Index '{index_name}' saved successfully!")
+                                    else:
+                                        st.error(f"Failed to save index: {response.status_code} - {response.data}")
+                                except Exception as e:
+                                    st.error(f"Error saving index: {e}")
+                            else:
+                                st.warning("Please enter an index name and ensure you are logged into Supabase.")
 
             except pd.errors.EmptyDataError:
                 st.error("The uploaded CSV file is empty.")
             except Exception as e:
                 st.error(f"Error processing file or calculating index: {e}. Please ensure the CSV format is correct and contains valid numeric data for weights.")
+        
+        st.markdown("---")
+        st.subheader("Load Saved Custom Indexes")
+        if st.session_state.get("user_id"):
+            if st.button("Load My Indexes", key="load_my_indexes_btn"):
+                try:
+                    response = supabase.table("custom_indexes").select("id, index_name, constituents").eq("user_id", st.session_state["user_id"]).execute()
+                    if response.data:
+                        st.session_state["saved_indexes"] = response.data
+                        st.success(f"Loaded {len(response.data)} indexes.")
+                    else:
+                        st.session_state["saved_indexes"] = []
+                        st.info("No saved indexes found for your account.")
+                except Exception as e:
+                    st.error(f"Error loading indexes: {e}")
+            
+            if st.session_state.get("saved_indexes"):
+                selected_index_option = st.selectbox(
+                    "Select an index to load and display:",
+                    ["--- Select ---"] + [idx['index_name'] for idx in st.session_state["saved_indexes"]],
+                    key="select_saved_index"
+                )
+
+                if selected_index_option != "--- Select ---":
+                    selected_index_data = next(
+                        (idx for idx in st.session_state["saved_indexes"] if idx['index_name'] == selected_index_option),
+                        None
+                    )
+                    if selected_index_data:
+                        loaded_constituents_df = pd.DataFrame(selected_index_data['constituents'])
+                        
+                        st.markdown(f"#### Displaying Loaded Index: {selected_index_option}")
+                        st.dataframe(loaded_constituents_df.style.format({
+                            "Weights": "{:.4f}"
+                        }), use_container_width=True)
+
+                        # Re-calculate live value for loaded index
+                        st.subheader("Recalculating Live Value for Loaded Index")
+                        recalc_quotes = {}
+                        recalc_progress = st.progress(0)
+                        recalc_status_text = st.empty()
+                        
+                        for i, row in loaded_constituents_df.iterrows():
+                            sym = row['symbol']
+                            recalc_status_text.text(f"Fetching price for {sym} ({i+1}/{len(loaded_constituents_df)})...")
+                            try:
+                                q = k.quote(f"NSE:{sym}")
+                                last_price = q.get(f"NSE:{sym}", {}).get("last_price")
+                                if last_price is not None:
+                                    recalc_quotes[sym] = last_price
+                                else:
+                                    recalc_quotes[sym] = np.nan
+                                    st.warning(f"Could not fetch live price for {sym} (loaded index). Setting to NaN.")
+                            except Exception as e:
+                                recalc_quotes[sym] = np.nan
+                                st.warning(f"Error fetching price for {sym} (loaded index): {e}. Setting to NaN.")
+                            recalc_progress.progress((i + 1) / len(loaded_constituents_df))
+                        
+                        recalc_progress.empty()
+                        recalc_status_text.empty()
+
+                        loaded_constituents_df["Last Price"] = loaded_constituents_df["symbol"].map(recalc_quotes)
+                        loaded_constituents_df["Weighted Price"] = loaded_constituents_df["Last Price"] * loaded_constituents_df["Weights"]
+                        
+                        recalculated_index_value = loaded_constituents_df["Weighted Price"].sum()
+
+                        st.dataframe(loaded_constituents_df.style.format({
+                            "Weights": "{:.4f}",
+                            "Last Price": "₹{:,.2f}",
+                            "Weighted Price": "₹{:,.2f}"
+                        }), use_container_width=True)
+
+                        st.success(f"✅ Live Value of '{selected_index_option}': **₹{recalculated_index_value:.2f}**")
+
+                        # Option to delete
+                        st.markdown("---")
+                        if st.button(f"Delete Index '{selected_index_option}'", key=f"delete_index_{selected_index_data['id']}"):
+                            try:
+                                response = supabase.table("custom_indexes").delete().eq("id", selected_index_data['id']).execute()
+                                if response.data:
+                                    st.success(f"Index '{selected_index_option}' deleted successfully.")
+                                    # Refresh saved indexes
+                                    st.session_state.pop("saved_indexes", None)
+                                    st.rerun()
+                                else:
+                                    st.error(f"Failed to delete index: {response.status_code} - {response.data}")
+                            except Exception as e:
+                                st.error(f"Error deleting index: {e}")
+
+            else:
+                st.info("No indexes loaded yet. Click 'Load My Indexes' to retrieve them.")
+        else:
+            st.info("Please login with your Supabase account to manage saved indexes.")
+
 
 # ---------------------------
 # TAB: WEBSOCKET (Ticker)
