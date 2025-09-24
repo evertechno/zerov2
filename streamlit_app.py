@@ -568,7 +568,7 @@ def render_portfolio_tab(kite_client: KiteConnect | None):
                 {"Category": "Equity - Available", "Value": st.session_state["margins_data"].get('equity', {}).get('available', {}).get('live_balance', 0)},
                 {"Category": "Equity - Used", "Value": st.session_state["margins_data"].get('equity', {}).get('utilised', {}).get('overall', 0)},
                 {"Category": "Commodity - Available", "Value": st.session_state["margins_data"].get('commodity', {}).get('available', {}).get('live_balance', 0)},
-                {"Category": "Commodity - Used", "Value": st.session_state["margins_data'].get('commodity', {}).get('utilised', {}).get('overall', 0)},
+                {"Category": "Commodity - Used", "Value": st.session_state["margins_data"].get('commodity', {}).get('utilised', {}).get('overall', 0)},
             ])
             margins_df["Value"] = margins_df["Value"].apply(lambda x: f"₹{x:,.2f}")
             st.dataframe(margins_df, use_container_width=True)
@@ -1153,7 +1153,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         st.subheader("Index Historical Performance")
 
         if index_history_df.empty or "_error" in index_history_df.columns:
-            st.warning(f"Historical performance data for '{index_name}' is not available or could not be calculated: {index_history_df.get('_error', 'Unknown Error')}")
+            st.warning(f"Historical performance data for '{index_name}' is not available or could not be calculated: {index_history_df.get('_error', ['Unknown Error'])[0]}")
             return # Cannot proceed with charting if no historical data
 
         fig_index_perf = go.Figure()
@@ -1194,7 +1194,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                                 else:
                                     st.warning(f"First historical value of {bench_symbol} is zero, cannot normalize. Skipping benchmark.")
                             else:
-                                st.warning(f"Benchmark '{bench_symbol}' data missing 'close_bench' column after merge. Skipping benchmark.")
+                                st.warning(f"Benchmark '{bench_symbol}' data missing 'close_bench' column after merge. This can happen if merge failed or data is insufficient. Skipping benchmark.")
                         else:
                             st.warning(f"No common historical data between custom index and benchmark {bench_symbol}. Skipping benchmark.")
                     else:
