@@ -137,5 +137,45 @@ if "kite_access_token" in st.session_state:
         if st.button("Fetch historical"):
             st.warning("⚠️ Historical data requires instrument_token (numeric). You must fetch instrument dump and map symbol → token.")
 
+    # --- INDEX CREATION FEATURE ---
+    st.markdown("---")
+    st.header("📊 Custom Index Creation")
+
+    uploaded_file = st.file_uploader("Upload CSV with columns: symbol, Name, Weights", type=["csv"])
+    if uploaded_file:
+        try:
+            df = pd.read_csv(uploaded_file)
+            required_cols = {"symbol", "Name", "Weights"}
+            if not required_cols.issubset(set(df.columns)):
+                st.error(f"CSV must contain columns: {required_cols}")
+            else:
+                # Normalize weights
+                df["Weights"] = df["Weights"] / df["Weights"].sum()
+
+                # Fetch live prices
+                quotes = {}
+                for sym in df["symbol"]:
+                    try:
+                        q = k.quote(f"NSE:{sym}")
+                        last_price = q[f"NSE:{sym}"]["last_price"]
+                        quotes[sym] = last_price
+                    except Exception as e:
+                        quotes[sym] = None
+                        st.warning(f"Could not fetch price for {sym}: {e}")
+
+                df["Last Price"] = df["symbol"].map(quotes)
+
+                # Calculate Index Value
+                df["Weighted Price"] = df["Last Price"] * df["Weights"]
+                index_value = df["Weighted Price"].sum()
+
+                st.subheader("📈 Index Constituents")
+                st.dataframe(df)
+
+                st.success(f"✅ Current Index Value: **{index_value:.2f}**")
+
+        except Exception as e:
+            st.error(f"Error processing file: {e}")
+
 else:
     st.info("ℹ️ No access token yet. Login via the link above and ensure the redirect URI matches exactly in developer console.")
