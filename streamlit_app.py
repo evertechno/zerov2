@@ -117,7 +117,7 @@ def load_instruments_cached(api_key: str, access_token: str, exchange: str = Non
     """Returns pandas.DataFrame of instrument data, using an internally created Kite instance."""
     kite_instance = get_authenticated_kite_client(api_key, access_token)
     if not kite_instance:
-        return pd.DataFrame({"error": "Kite not authenticated to load instruments."})
+        return pd.DataFrame({"_error": "Kite not authenticated to load instruments."})
     try:
         instruments = kite_instance.instruments(exchange) if exchange else kite_instance.instruments()
         df = pd.DataFrame(instruments)
@@ -125,37 +125,37 @@ def load_instruments_cached(api_key: str, access_token: str, exchange: str = Non
             df["instrument_token"] = df["instrument_token"].astype("int64")
         return df
     except Exception as e:
-        return pd.DataFrame({"error": f"Failed to load instruments for {exchange or 'all exchanges'}: {e}"})
+        return pd.DataFrame({"_error": f"Failed to load instruments for {exchange or 'all exchanges'}: {e}"})
 
 @st.cache_data(ttl=60) # Cache LTP for 1 minute
 def get_ltp_price_cached(api_key: str, access_token: str, symbol: str, exchange: str = DEFAULT_EXCHANGE):
     """Fetches LTP for a symbol, using an internally created Kite instance."""
     kite_instance = get_authenticated_kite_client(api_key, access_token)
     if not kite_instance:
-        return {"error": "Kite not authenticated to fetch LTP."}
+        return {"_error": "Kite not authenticated to fetch LTP."}
     
     exchange_symbol = f"{exchange.upper()}:{symbol.upper()}"
     try:
         ltp_data = kite_instance.ltp([exchange_symbol])
         return ltp_data.get(exchange_symbol)
     except Exception as e:
-        return {"error": str(e)}
+        return {"_error": str(e)}
 
 @st.cache_data(ttl=3600) # Cache historical data for 1 hour
 def get_historical_data_cached(api_key: str, access_token: str, symbol: str, from_date: datetime.date, to_date: datetime.date, interval: str, exchange: str = DEFAULT_EXCHANGE) -> pd.DataFrame:
     """Fetches historical data for a symbol, using an internally created Kite instance."""
     kite_instance = get_authenticated_kite_client(api_key, access_token)
     if not kite_instance:
-        return pd.DataFrame({"error": "Kite not authenticated to fetch historical data."})
+        return pd.DataFrame({"_error": ["Kite not authenticated to fetch historical data."]})
 
     # Load instruments for token lookup (this calls the *cached* load_instruments_cached)
     instruments_df = load_instruments_cached(api_key, access_token, exchange)
-    if "error" in instruments_df.columns:
-        return pd.DataFrame({"error": instruments_df.get('error', "Failed to load instruments for token lookup.")})
+    if "_error" in instruments_df.columns:
+        return pd.DataFrame({"_error": [instruments_df.get('_error', "Failed to load instruments for token lookup.")]})
 
     token = find_instrument_token(instruments_df, symbol, exchange)
     if not token:
-        return pd.DataFrame({"error": f"Instrument token not found for {symbol} on {exchange}."})
+        return pd.DataFrame({"_error": [f"Instrument token not found for {symbol} on {exchange}."]})
 
     from_datetime = datetime.combine(from_date, datetime.min.time())
     to_datetime = datetime.combine(to_date, datetime.max.time())
@@ -170,7 +170,7 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
             df.dropna(subset=['close'], inplace=True)
         return df
     except Exception as e:
-        return pd.DataFrame({"error": str(e)})
+        return pd.DataFrame({"_error": [str(e)]})
 
 
 def find_instrument_token(df: pd.DataFrame, tradingsymbol: str, exchange: str = DEFAULT_EXCHANGE) -> int | None:
@@ -257,7 +257,7 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
     Returns a DataFrame with 'date' and 'index_value'.
     """
     if constituents_df.empty:
-        return pd.DataFrame({"error": "No constituents provided for historical index calculation."})
+        return pd.DataFrame({"_error": ["No constituents provided for historical index calculation."]})
 
     all_historical_closes = {}
     
@@ -273,17 +273,17 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
         # Use the cached historical data function
         hist_df = get_historical_data_cached(api_key, access_token, symbol, start_date, end_date, "day", exchange)
         
-        if isinstance(hist_df, pd.DataFrame) and "error" not in hist_df.columns and not hist_df.empty:
+        if isinstance(hist_df, pd.DataFrame) and "_error" not in hist_df.columns and not hist_df.empty:
             all_historical_closes[symbol] = hist_df['close']
         else:
-            st.warning(f"Could not fetch historical data for {symbol}. Skipping for historical calculation. Error: {hist_df.get('error', 'Unknown')}")
+            st.warning(f"Could not fetch historical data for {symbol}. Skipping for historical calculation. Error: {hist_df.get('_error', 'Unknown')}")
         progress_bar_placeholder.progress((i + 1) / len(constituents_df))
 
     progress_text_placeholder.empty()
     progress_bar_placeholder.empty()
 
     if not all_historical_closes:
-        return pd.DataFrame({"error": "No historical data available for any constituent to build index."})
+        return pd.DataFrame({"_error": ["No historical data available for any constituent to build index."]})
 
     combined_closes = pd.DataFrame(all_historical_closes)
     
@@ -292,7 +292,7 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
     combined_closes.dropna(inplace=True) # Drop rows where all are still NaN
 
     if combined_closes.empty:
-        return pd.DataFrame({"error": "Insufficient common historical data for index calculation after cleaning."})
+        return pd.DataFrame({"_error": ["Insufficient common historical data for index calculation after cleaning."]})
 
     # Calculate daily weighted prices
     # Ensure weights are aligned correctly
@@ -312,8 +312,8 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
             index_history_df.index.name = 'date' # Ensure index name for later merging/plotting
             return index_history_df
         else:
-            return pd.DataFrame({"error": "First day's index value is zero, cannot normalize."})
-    return pd.DataFrame({"error": "Error in calculating or normalizing historical index values."})
+            return pd.DataFrame({"_error": ["First day's index value is zero, cannot normalize."]})
+    return pd.DataFrame({"_error": ["Error in calculating or normalizing historical index values."]})
 
 
 # --- Sidebar: Kite Login ---
@@ -471,12 +471,12 @@ def render_dashboard_tab(kite_client: KiteConnect | None, api_key: str | None, a
         st.subheader("Market Insight (NIFTY 50)")
         if api_key and access_token:
             nifty_ltp_data = get_ltp_price_cached(api_key, access_token, "NIFTY 50", DEFAULT_EXCHANGE) # Use cached LTP
-            if nifty_ltp_data and "error" not in nifty_ltp_data:
+            if nifty_ltp_data and "_error" not in nifty_ltp_data:
                 nifty_ltp = nifty_ltp_data.get("last_price", 0.0)
                 nifty_change = nifty_ltp_data.get("change", 0.0)
                 st.metric("NIFTY 50 (LTP)", f"₹{nifty_ltp:,.2f}", delta=f"{nifty_change:.2f}%")
             else:
-                st.warning(f"Could not fetch NIFTY 50 LTP: {nifty_ltp_data.get('error', 'Unknown error')}")
+                st.warning(f"Could not fetch NIFTY 50 LTP: {nifty_ltp_data.get('_error', 'Unknown error')}")
         else:
             st.info("Kite not authenticated to fetch NIFTY 50 LTP.")
 
@@ -485,11 +485,11 @@ def render_dashboard_tab(kite_client: KiteConnect | None, api_key: str | None, a
                 if api_key and access_token:
                     with st.spinner("Fetching NIFTY 50 historical data..."):
                         nifty_df = get_historical_data_cached(api_key, access_token, "NIFTY 50", datetime.now().date() - timedelta(days=180), datetime.now().date(), "day", DEFAULT_EXCHANGE)
-                        if isinstance(nifty_df, pd.DataFrame) and "error" not in nifty_df.columns:
+                        if isinstance(nifty_df, pd.DataFrame) and "_error" not in nifty_df.columns:
                             st.session_state["historical_data_NIFTY"] = nifty_df
                             st.success("NIFTY 50 historical data loaded.")
                         else:
-                            st.error(f"Error fetching NIFTY 50 historical: {nifty_df.get('error', 'Unknown error')}")
+                            st.error(f"Error fetching NIFTY 50 historical: {nifty_df.get('_error', 'Unknown error')}")
                 else:
                     st.warning("Kite not authenticated to fetch historical data.")
 
@@ -676,14 +676,14 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
     col_market_quote1, col_market_quote2 = st.columns([1, 2])
     with col_market_quote1:
         q_exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO"], key="market_exchange_tab")
-        q_symbol = st.text_input("Tradingsymbol", value="INFY", key="market_symbol_tab")
+        q_symbol = st.text_input("Tradingsymbol", value="NIFTY 50", key="market_symbol_tab")
         if st.button("Get Market Data", key="get_market_data_btn"):
             ltp_data = get_ltp_price_cached(api_key, access_token, q_symbol, q_exchange) # Use cached LTP
-            if ltp_data and "error" not in ltp_data:
+            if ltp_data and "_error" not in ltp_data:
                 st.session_state["current_market_data"] = ltp_data
                 st.success(f"Fetched LTP for {q_symbol}.")
             else:
-                st.error(f"Market data fetch failed for {q_symbol}: {ltp_data.get('error', 'Unknown error')}")
+                st.error(f"Market data fetch failed for {q_symbol}: {ltp_data.get('_error', 'Unknown error')}")
     with col_market_quote2:
         if st.session_state.get("current_market_data"):
             st.markdown("##### Latest Quote Details")
@@ -697,11 +697,11 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
         exchange_for_lookup = st.selectbox("Exchange to load instruments", ["NSE", "BSE", "NFO"], key="hist_inst_load_exchange_selector")
         if st.button("Load Instruments into Cache", key="load_inst_cache_btn"):
             df_instruments = load_instruments_cached(api_key, access_token, exchange_for_lookup) # Use cached instruments
-            if not df_instruments.empty and "error" not in df_instruments.columns:
+            if not df_instruments.empty and "_error" not in df_instruments.columns:
                 st.session_state["instruments_df"] = df_instruments
                 st.success(f"Loaded {len(df_instruments)} instruments.")
             else:
-                st.error(f"Failed to load instruments: {df_instruments.get('error', 'Unknown error')}")
+                st.error(f"Failed to load instruments: {df_instruments.get('_error', 'Unknown error')}")
 
 
     col_hist_controls, col_hist_plot = st.columns([1, 2])
@@ -715,12 +715,12 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
         if st.button("Fetch Historical Data", key="fetch_historical_data_btn"):
             with st.spinner(f"Fetching {interval} historical data for {hist_symbol}..."):
                 df_hist = get_historical_data_cached(api_key, access_token, hist_symbol, from_date, to_date, interval, hist_exchange) # Use cached historical
-                if isinstance(df_hist, pd.DataFrame) and "error" not in df_hist.columns:
+                if isinstance(df_hist, pd.DataFrame) and "_error" not in df_hist.columns:
                     st.session_state["historical_data"] = df_hist
                     st.session_state["last_fetched_symbol"] = hist_symbol
                     st.success(f"Fetched {len(df_hist)} records for {hist_symbol}.")
                 else:
-                    st.error(f"Historical fetch failed: {df_hist.get('error', 'Unknown error')}")
+                    st.error(f"Historical fetch failed: {df_hist.get('_error', 'Unknown error')}")
 
     with col_hist_plot:
         if not st.session_state.get("historical_data", pd.DataFrame()).empty:
@@ -1015,7 +1015,7 @@ def render_performance_analysis_tab(kite_client: KiteConnect | None):
                     # Fetch from Zerodha API via our cached function
                     benchmark_data_df = get_historical_data_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], benchmark_symbol, historical_data.index.min().date(), historical_data.index.max().date(), "day", DEFAULT_EXCHANGE)
                     
-                    if isinstance(benchmark_data_df, pd.DataFrame) and "error" not in benchmark_data_df.columns and not benchmark_data_df.empty:
+                    if isinstance(benchmark_data_df, pd.DataFrame) and "_error" not in benchmark_data_df.columns and not benchmark_data_df.empty:
                         benchmark_returns = benchmark_data_df['close'].pct_change().dropna() * 100
                         # Align dates
                         common_dates = returns_series.index.intersection(benchmark_returns.index)
@@ -1036,7 +1036,7 @@ def render_performance_analysis_tab(kite_client: KiteConnect | None):
                                 st.metric("Alpha (Annualized %)", f"{alpha_annual:.2f}%" if not np.isnan(alpha_annual) else "N/A")
                             else: st.warning("Not enough common data for Alpha/Beta.")
                         else: st.warning("No common historical data points with benchmark.")
-                    else: st.warning(f"Could not fetch benchmark data for {benchmark_symbol}: {benchmark_data_df.get('error', 'Unknown error')}")
+                    else: st.warning(f"Could not fetch benchmark data for {benchmark_symbol}: {benchmark_data_df.get('_error', 'Unknown error')}")
                 except Exception as e: st.error(f"Error fetching benchmark data: {e}")
         fig_cum_returns.update_layout(title_text=f"Cumulative Returns: {last_symbol} vs. Benchmark", height=500)
         st.plotly_chart(fig_cum_returns, use_container_width=True)
@@ -1062,8 +1062,8 @@ def render_multi_asset_analysis_tab(kite_client: KiteConnect | None, api_key: st
     if st.button("Fetch Multi-Asset Data & Analyze", key="fetch_multi_asset_btn"):
         # Load instruments once for all lookups in this tab
         df_instruments_load = load_instruments_cached(api_key, access_token, multi_asset_exchange)
-        if "error" in df_instruments_load.columns:
-            st.error(f"Failed to load instruments for lookup: {df_instruments_load.get('error', 'Unknown error')}")
+        if "_error" in df_instruments_load.columns:
+            st.error(f"Failed to load instruments for lookup: {df_instruments_load.get('_error', 'Unknown error')}")
             return
         st.session_state["instruments_df"] = df_instruments_load
 
@@ -1073,10 +1073,10 @@ def render_multi_asset_analysis_tab(kite_client: KiteConnect | None, api_key: st
         for i, symbol in enumerate(symbols_to_analyze):
             with st.spinner(f"Fetching historical data for {symbol}..."):
                 df = get_historical_data_cached(api_key, access_token, symbol, from_date_multi, to_date_multi, multi_asset_interval, multi_asset_exchange)
-                if not df.empty and "error" not in df.columns:
+                if not df.empty and "_error" not in df.columns:
                     all_historical_data[symbol] = df['close']
                 else:
-                    st.warning(f"No historical data for {symbol} or error: {df.get('error', 'Unknown error')}. Skipping.")
+                    st.warning(f"No historical data for {symbol} or error: {df.get('_error', 'Unknown error')}. Skipping.")
             progress_bar.progress((i + 1) / len(symbols_to_analyze))
         
         if len(all_historical_data) < 2:
@@ -1127,7 +1127,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         live_quotes = {}
         for sym in constituents_df["symbol"]:
             ltp_data = get_ltp_price_cached(api_key, access_token, sym, DEFAULT_EXCHANGE)
-            live_quotes[sym] = ltp_data.get("last_price", np.nan) if ltp_data and "error" not in ltp_data else np.nan
+            live_quotes[sym] = ltp_data.get("last_price", np.nan) if ltp_data and "_error" not in ltp_data else np.nan
         
         constituents_df["Last Price"] = constituents_df["symbol"].map(live_quotes)
         constituents_df["Weighted Price"] = constituents_df["Last Price"] * constituents_df["Weights"]
@@ -1150,8 +1150,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         st.markdown("---")
         st.subheader("Index Historical Performance")
 
-        if index_history_df.empty or "error" in index_history_df.columns:
-            st.warning(f"Historical performance data for '{index_name}' is not available or could not be calculated: {index_history_df.get('error', 'Unknown Error')}")
+        if index_history_df.empty or "_error" in index_history_df.columns:
+            st.warning(f"Historical performance data for '{index_name}' is not available or could not be calculated: {index_history_df.get('_error', 'Unknown Error')}")
             return # Cannot proceed with charting if no historical data
 
         fig_index_perf = go.Figure()
@@ -1166,9 +1166,10 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         if st.button("Add Benchmarks to Chart", key=f"add_benchmarks_{index_id or index_name}"):
             for bench_symbol in benchmark_symbols:
                 with st.spinner(f"Fetching historical data for benchmark {bench_symbol}..."):
+                    # Use get_historical_data_cached for benchmark data
                     bench_hist_df = get_historical_data_cached(api_key, access_token, bench_symbol, index_history_df.index.min().date(), index_history_df.index.max().date(), "day", benchmark_exchange)
                 
-                if isinstance(bench_hist_df, pd.DataFrame) and "error" not in bench_hist_df.columns and not bench_hist_df.empty:
+                if isinstance(bench_hist_df, pd.DataFrame) and "_error" not in bench_hist_df.columns and not bench_hist_df.empty:
                     # Align dates and normalize benchmark
                     aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df[['close']], left_index=True, right_index=True, how='inner', suffixes=('', '_bench'))
                     if not aligned_df.empty:
@@ -1183,7 +1184,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     else:
                         st.warning(f"No common historical data between custom index and benchmark {bench_symbol}.")
                 else:
-                    st.warning(f"No historical data obtained for benchmark {bench_symbol}. Skipping. Error: {bench_hist_df.get('error', 'Unknown')}")
+                    st.warning(f"No historical data obtained for benchmark {bench_symbol}. Skipping. Error: {bench_hist_df.get('_error', 'Unknown')}")
 
         fig_index_perf.update_layout(title_text=f"Historical Performance: {index_name} vs. Benchmarks",
                                   xaxis_title="Date", yaxis_title="Index Value (Normalized to 100 on Start Date)",
@@ -1244,7 +1245,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             with st.spinner("Calculating historical index values... This may take some time depending on constituents and date range."):
                 index_history_df_new = _calculate_historical_index_value(api_key, access_token, df_constituents_new, hist_start_date, hist_end_date, DEFAULT_EXCHANGE)
             
-            if not index_history_df_new.empty and "error" not in index_history_df_new.columns:
+            if not index_history_df_new.empty and "_error" not in index_history_df_new.columns:
                 st.session_state["current_calculated_index_data"] = df_constituents_new
                 st.session_state["current_calculated_index_history"] = index_history_df_new
                 st.success("Historical index values calculated successfully.")
@@ -1252,7 +1253,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 # Display details for the newly calculated index immediately
                 display_index_details("Newly Calculated Index", df_constituents_new, index_history_df_new)
             else:
-                st.error(f"Failed to calculate historical index values for new index: {index_history_df_new.get('error', 'Unknown error')}")
+                st.error(f"Failed to calculate historical index values for new index: {index_history_df_new.get('_error', 'Unknown error')}")
                 st.session_state["current_calculated_index_data"] = None
                 st.session_state["current_calculated_index_history"] = pd.DataFrame()
 
@@ -1320,21 +1321,22 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     loaded_historical_df.sort_index(inplace=True)
                 
                 # If historical data isn't saved or is empty, re-calculate it live
-                if loaded_historical_df.empty or "error" in loaded_historical_df.columns:
+                if loaded_historical_df.empty or "_error" in loaded_historical_df.columns:
                     st.warning(f"Historical data for '{selected_index_name_from_db}' was not found in DB or is invalid. Recalculating live...")
                     # Determine date range for recalculation based on current defaults
+                    # Default to 1 year for recalculation if no historical data is saved.
                     min_date = (datetime.now().date() - timedelta(days=365))
                     max_date = datetime.now().date()
                     
                     with st.spinner("Recalculating historical index values (live)..."):
                         recalculated_historical_df = _calculate_historical_index_value(api_key, access_token, loaded_constituents_df, min_date, max_date, DEFAULT_EXCHANGE)
                     
-                    if not recalculated_historical_df.empty and "error" not in recalculated_historical_df.columns:
+                    if not recalculated_historical_df.empty and "_error" not in recalculated_historical_df.columns:
                         loaded_historical_df = recalculated_historical_df
                         st.success("Historical data recalculated live.")
                     else:
-                        st.error(f"Failed to recalculate historical data: {recalculated_historical_df.get('error', 'Unknown error')}")
-                        loaded_historical_df = pd.DataFrame({"error": "Failed to recalculate historical data."})
+                        st.error(f"Failed to recalculate historical data: {recalculated_historical_df.get('_error', 'Unknown error')}")
+                        loaded_historical_df = pd.DataFrame({"_error": ["Failed to recalculate historical data."]})
 
 
                 display_index_details(selected_index_name_from_db, loaded_constituents_df, loaded_historical_df, selected_db_index_data['id'])
@@ -1369,10 +1371,10 @@ def render_websocket_tab(kite_client: KiteConnect | None):
         if st.session_state["instruments_df"].empty:
             st.info("Loading instruments for NSE to facilitate lookup.")
             df_instruments_load = load_instruments_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], DEFAULT_EXCHANGE)
-            if not df_instruments_load.empty and "error" not in df_instruments_load.columns:
+            if not df_instruments_load.empty and "_error" not in df_instruments_load.columns:
                 st.session_state["instruments_df"] = df_instruments_load
             else:
-                st.warning(f"Could not load instruments: {df_instruments_load.get('error', 'Unknown error')}")
+                st.warning(f"Could not load instruments: {df_instruments_load.get('_error', 'Unknown error')}")
         
         ws_exchange = st.selectbox("Exchange for Symbol Lookup", ["NSE", "BSE", "NFO"], key="ws_lookup_ex_selector")
         ws_tradingsymbol = st.text_input("Tradingsymbol", value="INFY", key="ws_lookup_sym_input")
@@ -1503,11 +1505,11 @@ def render_instruments_utils_tab(kite_client: KiteConnect | None, api_key: str |
     inst_exchange = st.selectbox("Select Exchange to Load Instruments", ["NSE", "BSE", "NFO", "CDS", "MCX"], key="inst_utils_exchange_selector")
     if st.button("Load Instruments for Selected Exchange (cached)", key="inst_utils_load_instruments_btn"):
         df_instruments = load_instruments_cached(api_key, access_token, inst_exchange) # Use cached instruments
-        if not df_instruments.empty and "error" not in df_instruments.columns:
+        if not df_instruments.empty and "_error" not in df_instruments.columns:
             st.session_state["instruments_df"] = df_instruments
             st.success(f"Loaded {len(df_instruments)} instruments for {inst_exchange}.")
         else:
-            st.error(f"Failed to load instruments: {df_instruments.get('error', 'Unknown error')}")
+            st.error(f"Failed to load instruments: {df_instruments.get('_error', 'Unknown error')}")
 
     df_instruments = st.session_state["instruments_df"] # Use the potentially updated df from session state
     if not df_instruments.empty:
