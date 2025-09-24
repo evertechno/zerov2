@@ -17,7 +17,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 import lightgbm as lgb
 import ta # Technical Analysis library
 import yfinance as yf # For fetching benchmark data for comparison
-import matplotlib.pyplot as plt # Added matplotlib import for pandas styler (though not directly used, good to keep)
+import matplotlib.pyplot as plt
 from typing import Optional, Dict, List
 
 st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
@@ -141,7 +141,6 @@ def fetch_last_price(kite_instance: KiteConnect, symbol: str, exchange_prefix="N
             return float(q[key]["last_price"])
         return None
     except Exception as e:
-        # st.error(f"Error fetching price for {symbol}: {e}") # Debugging
         return None
 
 def batch_fetch_prices(kite_instance: KiteConnect, syms: List[str], exchange_prefix="NSE", sleep_between=0.15) -> Dict[str, Optional[float]]:
@@ -272,11 +271,131 @@ def calculate_performance_metrics(returns_series, risk_free_rate=0.0):
 
 
 # ---------------------------
-# Sidebar for global actions
+# Sidebar: Supabase Auth (Integrated into sidebar logic)
 # ---------------------------
-with st.sidebar:
+st.sidebar.markdown("---")
+st.sidebar.header("Supabase Authentication")
+
+if "supabase_session" not in st.session_state:
+    st.session_state["supabase_session"] = None
+if "supabase_user" not in st.session_state:
+    st.session_state["supabase_user"] = None
+
+current_supabase_user = supabase_current_user()
+
+if not current_supabase_user:
+    st.sidebar.subheader("Supabase Login / Sign up")
+    sb_email = st.sidebar.text_input("Email", key="sb_login_email")
+    sb_password = st.sidebar.text_input("Password", type="password", key="sb_login_password")
+    col_sb_1, col_sb_2 = st.sidebar.columns(2)
+
+    with col_sb_1:
+        if st.button("Login (Supabase)", key="sb_login_button"):
+            if not sb_email or not sb_password:
+                st.sidebar.error("Email and password cannot be empty.")
+            else:
+                try:
+                    res = supabase.auth.sign_in_with_password({"email": sb_email, "password": sb_password})
+                    
+                    if res.user:
+                        st.session_state["supabase_session"] = res.session
+                        st.session_state["supabase_user"] = res.user
+                        st.sidebar.success(f"Supabase login successful! User: {get_user_email(res.user)}")
+                        st.rerun() # Use st.rerun()
+                    else:
+                        error_msg = "Unknown error during Supabase login."
+                        if res.error:
+                            error_msg = res.error.message
+                        st.sidebar.error(f"Supabase Login failed: {error_msg}")
+                except Exception as e:
+                    st.sidebar.error(f"Supabase Login failed: {pretty_error(e)}")
+
+    with col_sb_2:
+        if st.button("Sign up (Supabase)", key="sb_signup_button"):
+            if not sb_email or not sb_password:
+                st.sidebar.error("Email and password cannot be empty.")
+            else:
+                try:
+                    res = supabase.auth.sign_up({"email": sb_email, "password": sb_password})
+                    
+                    if res.user:
+                        st.sidebar.info("Signup created successfully. Please check your email to confirm your account before logging in.")
+                    else:
+                        error_msg = "Unknown error during signup."
+                        if res.error:
+                            error_msg = res.error.message
+                        st.sidebar.error(f"Supabase Signup failed: {error_msg}")
+                except Exception as e:
+                    st.sidebar.error(f"Supabase Sign up failed: {pretty_error(e)}")
+else:
+    st.sidebar.success(f"Supabase: Signed in as {get_user_email(current_supabase_user)}")
+    if st.sidebar.button("Logout (Supabase)", key="sb_logout_button"):
+        try:
+            supabase.auth.sign_out()
+        except Exception as e:
+            st.sidebar.warning(f"Supabase logout had a minor issue: {pretty_error(e)}")
+        st.session_state.pop("supabase_session", None)
+        st.session_state.pop("supabase_user", None)
+        st.rerun() # Use st.rerun()
+
+
+# ---------------------------
+# Helper: init unauth Kite client (used for login URL)
+# ---------------------------
+kite_client = KiteConnect(api_key=API_KEY)
+login_url = kite_client.login_url()
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Step 1 — Login to Kite")
+st.sidebar.write("Click the link below to login to Kite. Zerodha will redirect to your configured redirect URI with `request_token` in query params.")
+st.sidebar.markdown(f"[🔗 Open Kite login]({login_url})")
+
+# Read request_token from URL
+query_params = st.query_params
+request_token = query_params.get("request_token")
+
+# Initialize k to None at a top level so it always exists
+k = None 
+
+# Exchange request_token for access_token (only once)
+if request_token and "kite_access_token" not in st.session_state:
+    st.sidebar.info("Received request_token — exchanging for access token...")
+    try:
+        data = kite_client.generate_session(request_token, api_secret=API_SECRET)
+        access_token = data.get("access_token")
+        st.session_state["kite_access_token"] = access_token
+        st.session_state["kite_login_response"] = data
+        st.sidebar.success("Access token obtained and stored in session.")
+        st.sidebar.download_button("⬇️ Download token JSON", json.dumps(data, default=str), file_name="kite_token.json")
+        
+        # Clear request_token from query params to prevent re-exchange on refresh
+        if "request_token" in st.query_params:
+            del st.query_params["request_token"]
+        st.rerun() # Use st.rerun()
+    except Exception as e:
+        st.sidebar.error(f"Failed to generate session: {e}")
+        st.stop()
+
+# ---------------------------
+# Create authenticated kite client if we have access token
+# This block runs after potential st.rerun() and ensures k is set.
+# ---------------------------
+if "kite_access_token" in st.session_state:
+    access_token = st.session_state["kite_access_token"]
+    k = KiteConnect(api_key=API_KEY)
+    k.set_access_token(access_token)
+else:
+    # If no access token, k remains None. This is explicitly handled in later blocks.
+    pass 
+
+# ---------------------------
+# Sidebar for global actions (Now safe to reference 'k')
+# ---------------------------
+with st.sidebar: # This is the original sidebar block that now contains updated checks for k
+    # (Removed redundant Kite account info and logout from here as it's above)
+    st.markdown("---") # separator after auth
     st.header("Kite Account Info")
-    if k:
+    if k: # Now k is guaranteed to be either None or an authenticated client
         try:
             profile = k.profile()
             st.success("Kite Authenticated ✅")
@@ -289,9 +408,8 @@ with st.sidebar:
         if st.button("Logout (clear Kite token)", key="sidebar_logout_btn", help="This will clear your Kite access token from the session and require re-login."):
             st.session_state.pop("kite_access_token", None)
             st.session_state.pop("kite_login_response", None)
-            # Clear all session state for a clean re-run EXCEPT Supabase
             for key in list(st.session_state.keys()): 
-                if not key.startswith("supabase_"): # Preserve supabase session if exists
+                if not key.startswith("supabase_"):
                     st.session_state.pop(key)
             st.success("Kite Logged out. Please login again.")
             st.rerun()
@@ -313,7 +431,6 @@ with st.sidebar:
                 st.dataframe(st.session_state["holdings_data"])
     else:
         st.info("Login to Kite to access quick data.")
-
 
 # ---------------------------
 # Main UI - Tabs for modules
@@ -468,7 +585,7 @@ with tab_portfolio:
                     {"Category": "Equity - Available", "Value": st.session_state["margins_data"].get('equity', {}).get('available', {}).get('live_balance', 0)},
                     {"Category": "Equity - Used", "Value": st.session_state["margins_data"].get('equity', {}).get('utilised', {}).get('overall', 0)},
                     {"Category": "Commodity - Available", "Value": st.session_state["margins_data"].get('commodity', {}).get('available', {}).get('live_balance', 0)},
-                    {"Category": "Commodity - Used", "Value": st.session_state["margins_data"].get('commodity', {}).get('utilised', {}).get('overall', 0)},
+                    {"Category": "Commodity - Used", "Value": st.session_state["margins_data'].get('commodity', {}).get('utilised', {}).get('overall', 0)},
                 ])
                 margins_df["Value"] = margins_df["Value"].apply(lambda x: f"₹{x:,.2f}")
                 st.dataframe(margins_df, use_container_width=True)
@@ -1629,7 +1746,7 @@ with tab_saved_indices:
                             st.info("Fetching live prices for index components...")
                             if not k:
                                 st.warning("Kite Connect not logged in. Cannot fetch live prices for index components.")
-                                df_upload["Last Price"] = np.nan # Assign NaN if prices cannot be fetched
+                                df_upload["Last Price"] = np.nan
                             else:
                                 prices = batch_fetch_prices(k, df_upload["symbol"].tolist(), sleep_between=0.12)
                                 df_upload["Last Price"] = df_upload["symbol"].map(prices)
@@ -1666,7 +1783,7 @@ with tab_saved_indices:
                                             "details": json.dumps(calc_details)
                                         }).execute()
                                         st.success("Custom Index & initial snapshot saved successfully!")
-                                        st.rerun() # Use st.rerun()
+                                        st.rerun()
                                     else:
                                         st.error("Failed to retrieve index ID after saving. Snapshot not saved.")
                                 except Exception as e:
@@ -1833,3 +1950,4 @@ with tab_inst:
             st.dataframe(df_instruments.head(200), use_container_width=True)
         else:
             st.info("No instruments loaded. Click 'Load Instruments for Selected Exchange' above to fetch.")
+```
