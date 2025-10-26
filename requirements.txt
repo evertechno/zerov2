@@ -8,4 +8,4 @@ ta
 yfinance
 matplotlib
 PyMuPDF 
-google-generativeai.
+
