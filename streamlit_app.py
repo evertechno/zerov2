@@ -1,4 +1,3 @@
-
 import streamlit as st
 from kiteconnect import KiteConnect, KiteTicker
 import pandas as pd
@@ -17,7 +16,8 @@ import lightgbm as lgb
 import ta  # Technical Analysis library
 # import yfinance as yf  # Removed yfinance dependency - using Zerodha API exclusively
 
-# Supabase imports removed as requested.
+# Supabase imports
+from supabase import create_client, Client
 
 # --- Streamlit Page Configuration ---
 st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
@@ -39,7 +39,16 @@ if "historical_data" not in st.session_state:
     st.session_state["historical_data"] = pd.DataFrame()
 if "last_fetched_symbol" not in st.session_state:
     st.session_state["last_fetched_symbol"] = None
-# Supabase-related session states removed: "user_session", "user_id", "saved_indexes", "current_calculated_index_data", "current_calculated_index_history"
+if "user_session" not in st.session_state:
+    st.session_state["user_session"] = None
+if "user_id" not in st.session_state:
+    st.session_state["user_id"] = None
+if "saved_indexes" not in st.session_state:
+    st.session_state["saved_indexes"] = []
+if "current_calculated_index_data" not in st.session_state: # To store current CSV's index data
+    st.session_state["current_calculated_index_data"] = None
+if "current_calculated_index_history" not in st.session_state: # To store historical index values for plotting
+    st.session_state["current_calculated_index_history"] = pd.DataFrame()
 if "kt_ticker" not in st.session_state:
     st.session_state["kt_ticker"] = None
 if "kt_thread" not in st.session_state:
@@ -60,20 +69,28 @@ if "_rerun_ws" not in st.session_state: # Flag for WebSocket UI updates
 def load_secrets():
     secrets = st.secrets
     kite_conf = secrets.get("kite", {})
+    supabase_conf = secrets.get("supabase", {})
 
     errors = []
     if not kite_conf.get("api_key") or not kite_conf.get("api_secret") or not kite_conf.get("redirect_uri"):
         errors.append("Kite credentials (api_key, api_secret, redirect_uri)")
+    if not supabase_conf.get("url") or not supabase_conf.get("anon_key"):
+        errors.append("Supabase credentials (url, anon_key)")
 
     if errors:
         st.error(f"Missing required credentials in `.streamlit/secrets.toml`: {', '.join(errors)}.")
-        st.info("Example `secrets.toml`:\n```toml\n[kite]\napi_key=\"YOUR_KITE_API_KEY\"\napi_secret=\"YOUR_KITE_SECRET\"\nredirect_uri=\"http://localhost:8501\"\n```")
+        st.info("Example `secrets.toml`:\n```toml\n[kite]\napi_key=\"YOUR_KITE_API_KEY\"\napi_secret=\"YOUR_KITE_SECRET\"\nredirect_uri=\"http://localhost:8501\"\n\n[supabase]\nurl=\"YOUR_SUPABASE_URL\"\nanon_key=\"YOUR_SUPABASE_ANON_KEY\"\n```")
         st.stop()
-    return kite_conf
+    return kite_conf, supabase_conf
 
-KITE_CREDENTIALS = load_secrets() # Supabase credentials removed
+KITE_CREDENTIALS, SUPABASE_CREDENTIALS = load_secrets()
 
-# --- Supabase Client Initialization (removed) ---
+# --- Supabase Client Initialization ---
+@st.cache_resource(ttl=3600) # Cache for 1 hour to prevent re-initializing on every rerun
+def init_supabase_client(url: str, key: str) -> Client:
+    return create_client(url, key)
+
+supabase: Client = init_supabase_client(SUPABASE_CREDENTIALS["url"], SUPABASE_CREDENTIALS["anon_key"])
 
 # --- KiteConnect Client Initialization (Unauthenticated for login URL) ---
 @st.cache_resource(ttl=3600)
@@ -221,7 +238,7 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
     drawdown = (cumulative_returns - peak) / (peak + 1e-9)
     max_drawdown = drawdown.min() * 100
 
-    negative_returns = returns_series[returns_returns < 0]
+    negative_returns = returns_series[returns_series < 0]
     downside_std_dev = negative_returns.std()
     sortino_ratio = (annualized_return - risk_free_rate) / (downside_std_dev * np.sqrt(TRADING_DAYS_PER_YEAR)) if downside_std_dev != 0 else np.nan
 
@@ -234,7 +251,71 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
         "Sortino Ratio": sortino_ratio
     }
 
-# _calculate_historical_index_value function removed as custom index is removed
+@st.cache_data(ttl=3600, show_spinner="Calculating historical index values...")
+def _calculate_historical_index_value(api_key: str, access_token: str, constituents_df: pd.DataFrame, start_date: datetime.date, end_date: datetime.date, exchange: str = DEFAULT_EXCHANGE) -> pd.DataFrame:
+    """
+    Calculates the historical value of a custom index based on its constituents and weights.
+    Returns a DataFrame with 'date' and 'index_value'.
+    """
+    if constituents_df.empty:
+        return pd.DataFrame({"_error": ["No constituents provided for historical index calculation."]})
+
+    all_historical_closes = {}
+    
+    # Use a single progress bar for all fetches
+    progress_bar_placeholder = st.empty()
+    progress_text_placeholder = st.empty()
+    
+    for i, row in constituents_df.iterrows():
+        symbol = row['symbol']
+        weight = row['Weights']
+        progress_text_placeholder.text(f"Fetching historical data for {symbol} ({i+1}/{len(constituents_df)})...")
+        
+        # Use the cached historical data function
+        hist_df = get_historical_data_cached(api_key, access_token, symbol, start_date, end_date, "day", exchange)
+        
+        if isinstance(hist_df, pd.DataFrame) and "_error" not in hist_df.columns and not hist_df.empty:
+            all_historical_closes[symbol] = hist_df['close']
+        else:
+            error_msg = hist_df.get('_error', ['Unknown error'])[0] if isinstance(hist_df, pd.DataFrame) else 'Unknown error'
+            st.warning(f"Could not fetch historical data for {symbol}. Skipping for historical calculation. Error: {error_msg}")
+        progress_bar_placeholder.progress((i + 1) / len(constituents_df))
+
+    progress_text_placeholder.empty()
+    progress_bar_placeholder.empty()
+
+    if not all_historical_closes:
+        return pd.DataFrame({"_error": ["No historical data available for any constituent to build index."]})
+
+    combined_closes = pd.DataFrame(all_historical_closes)
+    
+    # Forward-fill and then back-fill any missing daily prices to be more robust
+    combined_closes = combined_closes.ffill().bfill()
+    combined_closes.dropna(inplace=True) # Drop rows where all are still NaN
+
+    if combined_closes.empty:
+        return pd.DataFrame({"_error": ["Insufficient common historical data for index calculation after cleaning."]})
+
+    # Calculate daily weighted prices
+    # Ensure weights are aligned correctly
+    # constituents_df should be indexed by 'symbol' for correct alignment
+    weighted_closes = combined_closes.mul(constituents_df.set_index('symbol')['Weights'], axis=1)
+
+    # Sum the weighted prices for each day to get the index value
+    index_history_series = weighted_closes.sum(axis=1)
+
+    # Normalize the index to a base value (e.g., 100 on the first day)
+    if not index_history_series.empty:
+        base_value = index_history_series.iloc[0]
+        if base_value != 0:
+            index_history_df = pd.DataFrame({
+                "index_value": (index_history_series / base_value) * 100
+            })
+            index_history_df.index.name = 'date' # Ensure index name for later merging/plotting
+            return index_history_df
+        else:
+            return pd.DataFrame({"_error": ["First day's index value is zero, cannot normalize."]})
+    return pd.DataFrame({"_error": ["Error in calculating or normalizing historical index values."]})
 
 
 # --- Sidebar: Kite Login ---
@@ -269,11 +350,77 @@ with st.sidebar:
         st.info("Not authenticated with Kite yet.")
 
 
-# --- Sidebar: Supabase Authentication (Removed) ---
-# The entire Supabase section from the sidebar is removed.
+# --- Sidebar: Supabase Authentication ---
+with st.sidebar:
+    st.markdown("### 2. Supabase User Account")
+    
+    # Check/refresh Supabase session
+    def _refresh_supabase_session():
+        try:
+            session_data = supabase.auth.get_session()
+            if session_data and session_data.user:
+                st.session_state["user_session"] = session_data
+                st.session_state["user_id"] = session_data.user.id
+            else:
+                st.session_state["user_session"] = None
+                st.session_state["user_id"] = None
+        except Exception:
+            st.session_state["user_session"] = None
+            st.session_state["user_id"] = None
+
+    _refresh_supabase_session()
+
+    if st.session_state["user_session"]:
+        st.success(f"Logged into Supabase as: {st.session_state['user_session'].user.email}")
+        if st.button("Logout from Supabase", key="supabase_logout_btn"):
+            try:
+                supabase.auth.sign_out()
+                _refresh_supabase_session() # Update session state immediately
+                st.sidebar.success("Logged out from Supabase.")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Error logging out: {e}")
+    else:
+        with st.form("supabase_auth_form"):
+            st.markdown("##### Email/Password Login/Sign Up")
+            email = st.text_input("Email", key="supabase_email_input", help="Your email for Supabase authentication.")
+            password = st.text_input("Password", type="password", key="supabase_password_input", help="Your password for Supabase authentication.")
+            
+            col_auth1, col_auth2 = st.columns(2)
+            with col_auth1:
+                login_submitted = st.form_submit_button("Login")
+            with col_auth2:
+                signup_submitted = st.form_submit_button("Sign Up")
+
+            if login_submitted:
+                if email and password:
+                    try:
+                        with st.spinner("Logging in..."):
+                            response = supabase.auth.sign_in_with_password({"email": email, "password": password})
+                        _refresh_supabase_session()
+                        st.success("Login successful! Welcome.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Login failed: {e}")
+                else:
+                    st.warning("Please enter both email and password for login.")
+            
+            if signup_submitted:
+                if email and password:
+                    try:
+                        with st.spinner("Signing up..."):
+                            response = supabase.auth.sign_up({"email": email, "password": password})
+                        _refresh_supabase_session()
+                        st.success("Sign up successful! Please check your email to confirm your account.")
+                        st.info("After confirming your email, you can log in.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Sign up failed: {e}")
+                else:
+                    st.warning("Please enter both email and password for sign up.")
 
     st.markdown("---")
-    st.markdown("### 2. Quick Data Access (Kite)") # Renumbered from 3 to 2
+    st.markdown("### 3. Quick Data Access (Kite)")
     if st.session_state["kite_access_token"]:
         current_k_client_for_sidebar = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
 
@@ -296,9 +443,8 @@ k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state[
 
 
 # --- Main UI - Tabs for modules ---
-# Removed "Custom Index" tab
-tabs = st.tabs(["Dashboard", "Portfolio", "Orders", "Market & Historical", "Machine Learning Analysis", "Risk & Stress Testing", "Performance Analysis", "Multi-Asset Analysis", "Websocket (stream)", "Instruments Utils"])
-tab_dashboard, tab_portfolio, tab_orders, tab_market, tab_ml, tab_risk, tab_performance, tab_multi_asset, tab_ws, tab_inst = tabs
+tabs = st.tabs(["Dashboard", "Portfolio", "Orders", "Market & Historical", "Machine Learning Analysis", "Risk & Stress Testing", "Performance Analysis", "Multi-Asset Analysis", "Custom Index", "Websocket (stream)", "Instruments Utils"])
+tab_dashboard, tab_portfolio, tab_orders, tab_market, tab_ml, tab_risk, tab_performance, tab_multi_asset, tab_custom_index, tab_ws, tab_inst = tabs
 
 # --- Tab Logic Functions ---
 
@@ -315,8 +461,8 @@ def render_dashboard_tab(kite_client: KiteConnect | None, api_key: str | None, a
     with col1:
         st.subheader("Account Summary")
         try:
-            profile = kite_client.profile() # Direct call
-            margins = kite_client.margins() # Direct call
+            profile = kite_client.profile() # Direct call, not cached
+            margins = kite_client.margins() # Direct call, not cached
             st.metric("Account Holder", profile.get("user_name", "N/A"))
             st.metric("Available Equity Margin", f"₹{margins.get('equity', {}).get('available', {}).get('live_balance', 0):,.2f}")
             st.metric("Available Commodity Margin", f"₹{margins.get('commodity', {}).get('available', {}).get('live_balance', 0):,.2f}")
@@ -428,56 +574,96 @@ def render_portfolio_tab(kite_client: KiteConnect | None):
             st.dataframe(margins_df, use_container_width=True)
 
 def render_orders_tab(kite_client: KiteConnect | None):
-    st.header("Orders & Trades Overview")
+    st.header("Orders — Place, Modify, Cancel & View")
     if not kite_client:
-        st.info("Login first to view orders and trades data.")
+        st.info("Login first to use orders API.")
         return
 
-    st.subheader("View Orders (Today)")
-    if st.button("Fetch All Orders (Today)", key="fetch_all_orders_btn_view_only"):
-        try:
-            orders = kite_client.orders() # Direct call
-            st.session_state["all_orders"] = pd.DataFrame(orders)
-            st.success(f"Fetched {len(orders)} orders.")
-        except Exception as e: 
-            st.error(f"Error fetching orders: {e}")
-    if not st.session_state.get("all_orders", pd.DataFrame()).empty:
-        with st.expander("Show Orders"): 
-            st.dataframe(st.session_state["all_orders"], use_container_width=True)
-    else:
-        st.info("No orders data available. Click 'Fetch All Orders (Today)'.")
+    st.subheader("Place New Order")
+    with st.form("place_order_form", clear_on_submit=False):
+        col_order1, col_order2 = st.columns(2)
+        with col_order1:
+            variety = st.selectbox("Variety", ["regular", "amo", "co", "iceberg"], key="order_variety")
+            exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO", "CDS", "MCX"], key="order_exchange")
+            tradingsymbol = st.text_input("Tradingsymbol", value="INFY", key="order_tradingsymbol")
+            transaction_type = st.radio("Transaction Type", ["BUY", "SELL"], horizontal=True, key="order_transaction_type")
+            quantity = st.number_input("Quantity", min_value=1, value=1, step=1, key="order_quantity")
+        with col_order2:
+            order_type = st.selectbox("Order Type", ["MARKET", "LIMIT", "SL", "SL-M"], key="order_type")
+            product = st.selectbox("Product Type", ["CNC", "MIS", "NRML", "CO", "MTF"], key="order_product")
+            price = st.text_input("Price (for LIMIT/SL)", value="", key="order_price")
+            trigger_price = st.text_input("Trigger Price (for SL/SL-M)", value="", key="order_trigger_price")
+            validity = st.selectbox("Validity", ["DAY", "IOC", "TTL"], key="order_validity")
+            tag = st.text_input("Tag (optional, max 20 chars)", value="", key="order_tag")
+        
+        submit_place = st.form_submit_button("Place Order", key="submit_place_order")
+        if submit_place:
+            try:
+                params = dict(variety=variety, exchange=exchange, tradingsymbol=tradingsymbol,
+                              transaction_type=transaction_type, order_type=order_type,
+                              quantity=int(quantity), product=product, validity=validity)
+                if price: params["price"] = float(price)
+                if trigger_price: params["trigger_price"] = float(trigger_price)
+                if tag: params["tag"] = tag[:20]
+
+                with st.spinner("Placing order..."):
+                    resp = kite_client.place_order(**params) # Direct call
+                    st.success(f"Order placed! ID: {resp.get('order_id')}")
+            except Exception as e:
+                st.error(f"Failed to place order: {e}")
 
     st.markdown("---")
-    st.subheader("View Trades (Today)")
-    if st.button("Fetch All Trades (Today)", key="fetch_all_trades_btn_view_only"):
-        try:
-            trades = kite_client.trades() # Direct call
-            st.session_state["all_trades"] = pd.DataFrame(trades)
-            st.success(f"Fetched {len(trades)} trades.")
-        except Exception as e: 
-            st.error(f"Error fetching trades: {e}")
-    if not st.session_state.get("all_trades", pd.DataFrame()).empty:
-        with st.expander("Show Trades"): 
-            st.dataframe(st.session_state["all_trades"], use_container_width=True)
-    else:
-        st.info("No trades data available. Click 'Fetch All Trades (Today)'.")
+    st.subheader("Manage Existing Orders & Trades")
+    col_view_orders, col_manage_single = st.columns(2)
 
-    st.markdown("---")
-    st.subheader("Order History by ID")
-    order_id_history = st.text_input("Enter Order ID to view history", key="order_id_history_input")
-    if st.button("Get Order History", key="get_order_history_btn_view_only"):
-        if order_id_history:
-            try: 
-                history = kite_client.order_history(order_id_history) # Direct call
-                if history:
-                    st.json(history)
-                else:
-                    st.info(f"No history found for Order ID: {order_id_history}")
-            except Exception as e: 
-                st.error(f"Failed to get order history: {e}")
-        else: 
-            st.warning("Please provide an Order ID.")
+    with col_view_orders:
+        if st.button("Fetch All Orders (Today)", key="fetch_all_orders_btn"):
+            try:
+                orders = kite_client.orders() # Direct call
+                st.session_state["all_orders"] = pd.DataFrame(orders)
+                st.success(f"Fetched {len(orders)} orders.")
+            except Exception as e: st.error(f"Error fetching orders: {e}")
+        if not st.session_state.get("all_orders", pd.DataFrame()).empty:
+            with st.expander("Show Orders"): st.dataframe(st.session_state["all_orders"], use_container_width=True)
 
+        if st.button("Fetch All Trades (Today)", key="fetch_all_trades_btn"):
+            try:
+                trades = kite_client.trades() # Direct call
+                st.session_state["all_trades"] = pd.DataFrame(trades)
+                st.success(f"Fetched {len(trades)} trades.")
+            except Exception as e: st.error(f"Error fetching trades: {e}")
+        if not st.session_state.get("all_trades", pd.DataFrame()).empty:
+            with st.expander("Show Trades"): st.dataframe(st.session_state["all_trades"], use_container_width=True)
+
+    with col_manage_single:
+        order_id_action = st.text_input("Order ID for action", key="order_id_action")
+        if st.button("Get Order History", key="get_order_history_btn"):
+            if order_id_action:
+                try: st.json(kite_client.order_history(order_id_action)) # Direct call
+                except Exception as e: st.error(f"Failed to get order history: {e}")
+            else: st.warning("Provide an Order ID.")
+        
+        with st.form("modify_order_form"):
+            mod_variety = st.selectbox("Variety (for Modify)", ["regular", "amo", "co", "iceberg"], key="mod_variety_selector")
+            mod_new_price = st.text_input("New Price (optional)", key="mod_new_price")
+            mod_new_qty = st.number_input("New Quantity (optional)", min_value=0, value=0, step=1, key="mod_new_qty")
+            submit_modify = st.form_submit_button("Modify Order", key="submit_modify_order")
+            if submit_modify:
+                if order_id_action:
+                    try:
+                        modify_args = {}
+                        if mod_new_price: modify_args["price"] = float(mod_new_price)
+                        if mod_new_qty > 0: modify_args["quantity"] = int(mod_new_qty)
+                        if not modify_args: st.warning("No new price or quantity.")
+                        else: st.json(kite_client.modify_order(variety=mod_variety, order_id=order_id_action, **modify_args)) # Direct call
+                    except Exception as e: st.error(f"Failed to modify order: {e}")
+                else: st.warning("Provide an Order ID to modify.")
+        
+        if st.button("Cancel Order", key="cancel_order_btn"):
+            if order_id_action:
+                try: st.json(kite_client.cancel_order(variety="regular", order_id=order_id_action)) # Direct call
+                except Exception as e: st.error(f"Failed to cancel order: {e}")
+            else: st.warning("Provide an Order ID to cancel.")
 
 def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("Market Data & Historical Candles")
@@ -920,7 +1106,294 @@ def render_multi_asset_analysis_tab(kite_client: KiteConnect | None, api_key: st
         fig_corr_heatmap.update_layout(title_text='Correlation Heatmap', height=600)
         st.plotly_chart(fig_corr_heatmap, use_container_width=True)
 
-# render_custom_index_tab function removed entirely
+def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Client, api_key: str | None, access_token: str | None):
+    st.header("📊 Custom Index Creation, Benchmarking & Export")
+    
+    if not kite_client:
+        st.info("Login to Kite first to fetch live and historical prices for index constituents.")
+        return
+    if not st.session_state["user_id"]:
+        st.info("Login with your Supabase account in the sidebar to save and load custom indexes.")
+        return
+    if not api_key or not access_token:
+        st.info("Kite authentication details required for data access.")
+        return
+
+    # Helper function to render an index's details, charts, and export options
+    def display_index_details(index_name: str, constituents_df: pd.DataFrame, index_history_df: pd.DataFrame, index_id: str | None = None):
+        st.markdown(f"### Details for Index: **{index_name}**")
+        
+        st.subheader("Constituents and Current Live Value")
+        
+        # Recalculate live value (might be slightly different from saved if saved with old prices)
+        live_quotes = {}
+        # Fetch all LTPs in one go if possible, then map
+        symbols_for_ltp = [sym for sym in constituents_df["symbol"]]
+        if symbols_for_ltp:
+            try:
+                # Get the raw KiteConnect client to call the ltp method
+                kc_client = get_authenticated_kite_client(api_key, access_token)
+                if kc_client:
+                    ltp_data_batch = kc_client.ltp([f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp])
+                    for sym in symbols_for_ltp:
+                        key = f"{DEFAULT_EXCHANGE}:{sym}"
+                        if key in ltp_data_batch:
+                            live_quotes[sym] = ltp_data_batch[key].get("last_price", np.nan)
+                        else:
+                            live_quotes[sym] = np.nan # Not found in batch response
+                else:
+                    st.warning("Kite client not available for batch LTP fetch.")
+            except Exception as e:
+                st.error(f"Error fetching batch LTP: {e}. Falling back to individual fetch (might be slower).")
+                # Fallback to individual fetch if batch fails
+                for sym in symbols_for_ltp:
+                    ltp_data = get_ltp_price_cached(api_key, access_token, sym, DEFAULT_EXCHANGE)
+                    live_quotes[sym] = ltp_data.get("last_price", np.nan) if ltp_data and "_error" not in ltp_data else np.nan
+        
+        constituents_df["Last Price"] = constituents_df["symbol"].map(live_quotes)
+        constituents_df["Weighted Price"] = constituents_df["Last Price"] * constituents_df["Weights"]
+        current_live_value = constituents_df["Weighted Price"].sum()
+
+        st.dataframe(constituents_df.style.format({
+            "Weights": "{:.4f}",
+            "Last Price": "₹{:,.2f}",
+            "Weighted Price": "₹{:,.2f}"
+        }), use_container_width=True)
+        st.success(f"Current Live Calculated Index Value: **₹{current_live_value:,.2f}**")
+
+        st.markdown("---")
+        st.subheader("Index Composition")
+        fig_pie = go.Figure(data=[go.Pie(labels=constituents_df['Name'], values=constituents_df['Weights'], hole=.3)])
+        fig_pie.update_layout(title_text='Constituent Weights', height=400)
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+
+        st.markdown("---")
+        st.subheader("Index Historical Performance")
+
+        if index_history_df.empty or "_error" in index_history_df.columns:
+            st.warning(f"Historical performance data for '{index_name}' is not available or could not be calculated: {index_history_df.get('_error', ['Unknown Error'])[0]}")
+            return # Cannot proceed with charting if no historical data
+
+        fig_index_perf = go.Figure()
+        fig_index_perf.add_trace(go.Scatter(x=index_history_df.index, y=index_history_df['index_value'], mode='lines', name=f'Custom Index ({index_name})', line=dict(color='blue', width=2)))
+        
+        # Benchmarking
+        st.markdown("##### Benchmark Comparison (from Zerodha API)")
+        benchmark_symbols_str = st.text_input("Enter Benchmark Symbols (comma-separated, e.g., NIFTY 50,BANKNIFTY)", value="NIFTY 50", key=f"benchmark_symbols_{index_id or index_name}")
+        benchmark_symbols = [s.strip().upper() for s in benchmark_symbols_str.split(',') if s.strip()]
+        benchmark_exchange = st.selectbox("Benchmark Exchange", ["NSE", "BSE", "NFO"], key=f"bench_exchange_{index_id or index_name}")
+
+        if st.button("Add Benchmarks to Chart", key=f"add_benchmarks_{index_id or index_name}"):
+            # Load instruments for benchmark token lookup (once for this button click)
+            instruments_df_for_bench = load_instruments_cached(api_key, access_token, benchmark_exchange)
+            if "_error" in instruments_df_for_bench.columns:
+                st.error(f"Failed to load instruments for benchmark lookup: {instruments_df_for_bench.loc[0, '_error']}")
+                return
+
+            for bench_symbol in benchmark_symbols:
+                with st.spinner(f"Fetching historical data for benchmark {bench_symbol}..."):
+                    # Use get_historical_data_cached for benchmark data
+                    bench_hist_df = get_historical_data_cached(api_key, access_token, bench_symbol, index_history_df.index.min().date(), index_history_df.index.max().date(), "day", benchmark_exchange)
+                
+                if isinstance(bench_hist_df, pd.DataFrame) and "_error" not in bench_hist_df.columns and not bench_hist_df.empty:
+                    # Align dates and normalize benchmark
+                    # Make sure 'close' column exists before trying to select it
+                    if 'close' in bench_hist_df.columns:
+                        # Rename the 'close' column in bench_hist_df explicitly before merging
+                        bench_hist_df_renamed = bench_hist_df[['close']].rename(columns={'close': f'{bench_symbol}_close_bench'})
+                        
+                        # Merge with index_history_df
+                        aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df_renamed, left_index=True, right_index=True, how='inner')
+                        
+                        if not aligned_df.empty:
+                            benchmark_col_name = f'{bench_symbol}_close_bench'
+                            if benchmark_col_name in aligned_df.columns: # Verify column exists after merge
+                                # Normalize benchmark to the same base as custom index
+                                base_index_val = aligned_df['index_value'].iloc[0]
+                                base_bench_val = aligned_df[benchmark_col_name].iloc[0]
+                                if base_bench_val != 0:
+                                    aligned_df[f'{bench_symbol}_normalized'] = (aligned_df[benchmark_col_name] / base_bench_val) * base_index_val
+                                    fig_index_perf.add_trace(go.Scatter(x=aligned_df.index, y=aligned_df[f'{bench_symbol}_normalized'], mode='lines', name=f'Benchmark: {bench_symbol}', line=dict(dash='dash')))
+                                else:
+                                    st.warning(f"First historical value of {bench_symbol} is zero, cannot normalize. Skipping benchmark.")
+                            else:
+                                st.warning(f"Benchmark '{bench_symbol}' data missing expected column '{benchmark_col_name}' after merge. This can happen if merge failed or data is insufficient. Skipping benchmark.")
+                        else:
+                            st.warning(f"No common historical data between custom index and benchmark {bench_symbol}. Skipping benchmark.")
+                    else:
+                        st.warning(f"Benchmark '{bench_symbol}' historical data does not contain 'close' column. Skipping benchmark.")
+                else:
+                    error_msg = bench_hist_df.get('_error', ['Unknown error'])[0] if isinstance(bench_hist_df, pd.DataFrame) else 'Unknown error'
+                    st.warning(f"No historical data obtained for benchmark {bench_symbol}. Skipping. Error: {error_msg}")
+
+        fig_index_perf.update_layout(title_text=f"Historical Performance: {index_name} vs. Benchmarks",
+                                  xaxis_title="Date", yaxis_title="Index Value (Normalized to 100 on Start Date)",
+                                  height=500, template="plotly_white", hovermode="x unified")
+        st.plotly_chart(fig_index_perf, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("Export Options")
+        col_export1, col_export2 = st.columns(2)
+        with col_export1:
+            csv_constituents = constituents_df[['symbol', 'Name', 'Weights']].to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="Export Constituents to CSV",
+                data=csv_constituents,
+                file_name=f"{index_name}_constituents.csv",
+                mime="text/csv",
+                key=f"export_constituents_{index_id or index_name}"
+            )
+        with col_export2:
+            csv_history = index_history_df.to_csv().encode('utf-8')
+            st.download_button(
+                label="Export Historical Performance to CSV",
+                data=csv_history,
+                file_name=f"{index_name}_historical_performance.csv",
+                mime="text/csv",
+                key=f"export_history_{index_id or index_name}"
+            )
+
+    # --- Index Creation ---
+    st.markdown("---")
+    st.subheader("1. Create New Index from CSV")
+    uploaded_file = st.file_uploader("Upload CSV with columns: symbol, Name, Weights", type=["csv"], key="index_upload_csv")
+    
+    if uploaded_file:
+        try:
+            df_constituents_new = pd.read_csv(uploaded_file)
+            required_cols = {"symbol", "Name", "Weights"}
+            if not required_cols.issubset(set(df_constituents_new.columns)):
+                st.error(f"CSV must contain columns: {required_cols}.")
+                return
+
+            df_constituents_new["Weights"] = pd.to_numeric(df_constituents_new["Weights"], errors='coerce')
+            df_constituents_new.dropna(subset=["Weights"], inplace=True)
+            if df_constituents_new["Weights"].sum() == 0:
+                st.error("Sum of weights cannot be zero.")
+                return
+            df_constituents_new["Weights"] = df_constituents_new["Weights"] / df_constituents_new["Weights"].sum()
+            st.info(f"Loaded {len(df_constituents_new)} constituents. Normalized weights.")
+
+            st.subheader("Configure Historical Calculation for New Index")
+            hist_start_date = st.date_input("Historical Start Date (for new index)", value=datetime.now().date() - timedelta(days=365), key="new_index_hist_start_date")
+            hist_end_date = st.date_input("Historical End Date (for new index)", value=datetime.now().date(), key="new_index_hist_end_date")
+
+            if hist_start_date >= hist_end_date:
+                st.error("Historical start date must be before end date.")
+                return
+
+            with st.spinner("Calculating historical index values... This may take some time depending on constituents and date range."):
+                index_history_df_new = _calculate_historical_index_value(api_key, access_token, df_constituents_new, hist_start_date, hist_end_date, DEFAULT_EXCHANGE)
+            
+            if not index_history_df_new.empty and "_error" not in index_history_df_new.columns:
+                st.session_state["current_calculated_index_data"] = df_constituents_new
+                st.session_state["current_calculated_index_history"] = index_history_df_new
+                st.success("Historical index values calculated successfully.")
+
+                # Display details for the newly calculated index immediately
+                display_index_details("Newly Calculated Index", df_constituents_new, index_history_df_new)
+            else:
+                st.error(f"Failed to calculate historical index values for new index: {index_history_df_new.get('_error', 'Unknown error')}")
+                st.session_state["current_calculated_index_data"] = None
+                st.session_state["current_calculated_index_history"] = pd.DataFrame()
+
+
+            if st.session_state["current_calculated_index_data"] is not None and not st.session_state["current_calculated_index_history"].empty:
+                st.markdown("---")
+                st.subheader("Save Newly Created Index to Database")
+                index_name_to_save = st.text_input("Enter a name for this new index to save", key="new_index_save_name")
+                if st.button("Save New Index to DB", key="save_new_index_to_db_btn"):
+                    if index_name_to_save and st.session_state["user_id"]:
+                        try:
+                            index_data = {
+                                "user_id": st.session_state["user_id"],
+                                "index_name": index_name_to_save,
+                                "constituents": st.session_state["current_calculated_index_data"][['symbol', 'Name', 'Weights']].to_dict(orient='records'),
+                                "historical_performance": st.session_state["current_calculated_index_history"].reset_index().to_dict(orient='records') # Store history
+                            }
+                            response = supabase_client.table("custom_indexes").insert(index_data).execute()
+                            if response.data:
+                                st.success(f"Index '{index_name_to_save}' saved successfully to Supabase!")
+                                st.session_state["saved_indexes"] = [] # Clear to force reload
+                                st.session_state["current_calculated_index_data"] = None # Clear new index data after saving
+                                st.session_state["current_calculated_index_history"] = pd.DataFrame()
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to save index: {response.data}")
+                        except Exception as e:
+                            st.error(f"Error saving new index: {e}")
+                    else:
+                        st.warning("Please enter an index name and ensure you are logged into Supabase.")
+
+        except pd.errors.EmptyDataError:
+            st.error("The uploaded CSV file is empty.")
+        except Exception as e:
+            st.error(f"Error processing file or calculating index: {e}.")
+    
+    st.markdown("---")
+    st.subheader("3. Load & Manage Saved Indexes")
+    if st.button("Load My Indexes from DB", key="load_my_indexes_db_btn"):
+        try:
+            response = supabase_client.table("custom_indexes").select("id, index_name, constituents, historical_performance").eq("user_id", st.session_state["user_id"]).execute()
+            if response.data:
+                st.session_state["saved_indexes"] = response.data
+                st.success(f"Loaded {len(response.data)} indexes.")
+            else:
+                st.session_state["saved_indexes"] = []
+                st.info("No saved indexes found for your account.")
+        except Exception as e: st.error(f"Error loading indexes: {e}")
+    
+    if st.session_state.get("saved_indexes"):
+        index_names_from_db = [idx['index_name'] for idx in st.session_state["saved_indexes"]]
+        selected_index_name_from_db = st.selectbox("Select a saved index to display:", ["--- Select ---"] + index_names_from_db, key="select_saved_index_from_db")
+
+        if selected_index_name_from_db != "--- Select ---":
+            selected_db_index_data = next((idx for idx in st.session_state["saved_indexes"] if idx['index_name'] == selected_index_name_from_db), None)
+            if selected_db_index_data:
+                loaded_constituents_df = pd.DataFrame(selected_db_index_data['constituents'])
+                loaded_historical_performance_raw = selected_db_index_data.get('historical_performance')
+
+                loaded_historical_df = pd.DataFrame()
+                if loaded_historical_performance_raw:
+                    loaded_historical_df = pd.DataFrame(loaded_historical_performance_raw)
+                    loaded_historical_df['date'] = pd.to_datetime(loaded_historical_df['date'])
+                    loaded_historical_df.set_index('date', inplace=True)
+                    loaded_historical_df.sort_index(inplace=True)
+                
+                # If historical data isn't saved or is empty, re-calculate it live
+                if loaded_historical_df.empty or "_error" in loaded_historical_df.columns:
+                    st.warning(f"Historical data for '{selected_index_name_from_db}' was not found in DB or is invalid. Recalculating live...")
+                    # Determine date range for recalculation based on current defaults
+                    # Default to 1 year for recalculation if no historical data is saved.
+                    min_date = (datetime.now().date() - timedelta(days=365))
+                    max_date = datetime.now().date()
+                    
+                    with st.spinner("Recalculating historical index values (live)..."):
+                        recalculated_historical_df = _calculate_historical_index_value(api_key, access_token, loaded_constituents_df, min_date, max_date, DEFAULT_EXCHANGE)
+                    
+                    if not recalculated_historical_df.empty and "_error" not in recalculated_historical_df.columns:
+                        loaded_historical_df = recalculated_historical_df
+                        st.success("Historical data recalculated live.")
+                    else:
+                        st.error(f"Failed to recalculate historical data: {recalculated_historical_df.get('_error', 'Unknown error')}")
+                        loaded_historical_df = pd.DataFrame({"_error": ["Failed to recalculate historical data."]})
+
+
+                display_index_details(selected_index_name_from_db, loaded_constituents_df, loaded_historical_df, selected_db_index_data['id'])
+                
+                st.markdown("---")
+                if st.button(f"Delete Index '{selected_index_name_from_db}' from DB", key=f"delete_index_{selected_db_index_data['id']}"):
+                    try:
+                        response = supabase_client.table("custom_indexes").delete().eq("id", selected_db_index_data['id']).execute()
+                        if response.data:
+                            st.success(f"Index '{selected_index_name_from_db}' deleted successfully.")
+                            st.session_state["saved_indexes"] = []
+                            st.rerun()
+                        else: st.error(f"Failed to delete index: {response.data}")
+                    except Exception as e: st.error(f"Error deleting index: {e}")
+            else: st.error("Selected index data not found.")
+    else: st.info("No indexes loaded yet. Click 'Load My Indexes from DB'.")
 
 
 def render_websocket_tab(kite_client: KiteConnect | None):
@@ -1119,6 +1592,6 @@ with tab_ml: render_ml_analysis_tab(k, api_key, access_token)
 with tab_risk: render_risk_stress_testing_tab(k)
 with tab_performance: render_performance_analysis_tab(k)
 with tab_multi_asset: render_multi_asset_analysis_tab(k, api_key, access_token)
-# tab_custom_index (removed)
+with tab_custom_index: render_custom_index_tab(k, supabase, api_key, access_token)
 with tab_ws: render_websocket_tab(k)
 with tab_inst: render_instruments_utils_tab(k, api_key, access_token)
